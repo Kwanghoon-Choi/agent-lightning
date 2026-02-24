@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import threading
@@ -38,6 +39,25 @@ def to_otel_status_code(status_code: StatusCode) -> trace_api.StatusCode:
         return trace_api.StatusCode.ERROR
     else:
         return trace_api.StatusCode.OK
+
+def _build_basic_auth_header_from_env() -> str | None:
+    # 1) 사용자가 직접 넣는 형태 (AgentLightning 우선)
+    # raw = os.getenv("AGL_OTLP_HEADERS")
+    # if raw:
+    #     return raw
+
+    # # 2) OTEL 표준 환경변수 그대로 사용
+    # raw = os.getenv("OTEL_EXPORTER_OTLP_HEADERS")
+    # if raw:
+    #     return raw
+
+    # 3) Langfuse PK/SK로부터 생성 (AGL_* 또는 LANGFUSE_* 모두 허용)
+    pk = os.getenv("AGL_LANGFUSE_PUBLIC_KEY") or os.getenv("LANGFUSE_PUBLIC_KEY")
+    sk = os.getenv("AGL_LANGFUSE_SECRET_KEY") or os.getenv("LANGFUSE_SECRET_KEY")
+    if not (pk and sk):
+        return None
+    token = base64.b64encode(f"{pk}:{sk}".encode("utf-8")).decode("ascii")
+    return f"Authorization=Basic {token}"
 
 
 class OtelSpanRecordingContext(SpanRecordingContext):
@@ -259,6 +279,11 @@ class OtelTracer(Tracer):
                 {
                     LightningResourceAttributes.ROLLOUT_ID.value: rollout_id,
                     LightningResourceAttributes.ATTEMPT_ID.value: attempt_id,
+
+                    # kh: metadata로 넣어보기 - 1번째 방법 (Resource로 넣으면 metadata 밖에 못 가게됨)
+                    # 그리고 값이 섞일수도 있다고 하던데? “프로세스/TracerProvider 전역”?
+                    # "langfuse.trace.metadata.rollout_id": "222222222",
+                    # "langfuse.trace.metadata.attempt_id": "333333333",
                 }
             )
         )
@@ -272,7 +297,7 @@ class OtelTracer(Tracer):
                 processor.disable_store_submission = True
 
                 # kh added
-                logger.debug(f"disable_store_submission set to True for rollout={rollout_id} attempt={attempt_id}")
+                logger.info(f"disable_store_submission set to True for rollout={rollout_id} attempt={attempt_id}")
             elif isinstance(processor, (SimpleSpanProcessor, BatchSpanProcessor)):
                 # Instead, we rely on the OTLPSpanExporter to send spans to the store.
                 if isinstance(processor.span_exporter, LightningStoreOTLPExporter):
@@ -288,8 +313,15 @@ class OtelTracer(Tracer):
 
                     # option 3 (switchable via env var)
                     endpoint = os.getenv("AGL_OTLP_ENDPOINT") or store.otlp_traces_endpoint()
+                    os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = endpoint
+                    logger.info(f"Set LightningStoreOTLPExporter endpoint to {endpoint}")
+
+                    hdr = _build_basic_auth_header_from_env()
+                    if hdr:
+                        os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = hdr
+
                     processor.span_exporter.enable_store_otlp(endpoint, rollout_id, attempt_id)
-                    logger.debug(f"[SET] enabling span export to {endpoint} rollout={rollout_id} attempt={attempt_id}")
+                    logger.info(f"[SET] enabling span export to {endpoint} rollout={rollout_id} attempt={attempt_id}")
 
                     instrumented = True
                 else:
@@ -413,6 +445,8 @@ class LightningSpanProcessor(SpanProcessor):
     def __enter__(self):
         self._last_trace = None
         self._spans = []
+        # Sequence IDs are scoped per active trace context.
+        self._local_sequence_id = 0
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):
@@ -483,6 +517,8 @@ class LightningSpanProcessor(SpanProcessor):
                     self._store, self._rollout_id, self._attempt_id = store, rollout_id, attempt_id
                     self._last_trace = None
                     self._spans = []
+                    # Reset counter for each rollout/attempt context.
+                    self._local_sequence_id = 0
                 return self
 
             def __exit__(_, exc_type, exc, tb):  # type: ignore
@@ -511,7 +547,7 @@ class LightningSpanProcessor(SpanProcessor):
 
                     # kh added
                     # logger.info(
-                    #     "[SET] Exporting spans to STORE; rollout=%s attempt=%s",
+                    #     "[SETTT] Exporting spans to STORE; rollout=%s attempt=%s",
                     #     span.name, self._rollout_id, self._attempt_id
                     # )
 
@@ -551,11 +587,99 @@ class LightningSpanProcessor(SpanProcessor):
 
         else:
             # Fallback path
+            # kh: 여기서 span에 rollout_id, attempt_id, sequence_id 붙는다
             created_span = Span.from_opentelemetry(
                 span,
                 rollout_id=self._rollout_id or "rollout-dummy",
                 attempt_id=self._attempt_id or "attempt-dummy",
                 sequence_id=self._local_sequence_id,
             )
-            self._local_sequence_id += 1
+
+            if not os.getenv("AGL_OTLP_ENDPOINT"):
+                self._local_sequence_id += 1
+            else:
+                # Langfuse/OTLP path: preserve legacy semantic (assign at on_end),
+                try:
+                    span._resource = span._resource.merge(  # pyright: ignore[reportPrivateUsage]
+                        Resource.create(
+                            {
+                                LightningResourceAttributes.SPAN_SEQUENCE_ID.value: str(self._local_sequence_id),
+                            }
+                        )
+                    )
+                    self._local_sequence_id += 1
+                except Exception:
+                    logger.exception("Failed to merge sequence_id into span resource for span=%s", span.name)
+
+            # print(f"ON_END _local_sequence_id={self._local_sequence_id} for span={span.name} rollout={self._rollout_id} attempt={self._attempt_id}")
+
             self._spans.append(created_span)
+            # kh
+            # print(f"[GGAGAGAG] self._rollout_id={self._rollout_id} self._attempt_id={self._attempt_id} disable_store_submission={self._disable_store_submission}")
+
+
+    def _langfuse_query_attributes(self) -> dict[str, Any]:
+        """
+        모든 span에 자동으로 붙일 Langfuse query-friendly attributes.
+        - sessionId: langfuse.session.id
+        - tags: langfuse.trace.tags
+        """
+        if not self._rollout_id or not self._attempt_id:
+            return {}
+
+        rid = str(self._rollout_id)
+        aid = str(self._attempt_id)
+
+        return {        # kh: 2번째 방법 - span attributes로 넣어야 sessionID/tags로 활용 가능
+            # rollout 단위 query/grouping
+            "langfuse.session.id": rid,
+
+            # attempt 단위 분해
+            "langfuse.trace.tags": aid,
+        }
+
+    def on_start(self, span: Any, parent_context: Optional[object] = None) -> None:
+        """
+        SpanProcessor hook: span 생성 직후 호출됨.
+        여기서 set_attribute 하면 exporter(OTLP)로 나가는 span에도 반영됨.
+
+        Langfuse 경로에서는 여기서 아래 두 가지를 같이 주입한다.
+        1) query용 키(`langfuse.session.id`, `langfuse.trace.tags`)
+        2) 기존 store 흐름과 맞추기 위한 `agentlightning.span_sequence_id`
+        """
+        # kh: Langfuse 사용할 때만 하는 걸로
+        if not os.getenv("AGL_OTLP_ENDPOINT"):
+            return
+
+        attrs = self._langfuse_query_attributes()
+        if not attrs:
+            return
+
+        # 이미 사용자/다른 레이어가 넣은 값은 덮어쓰지 않는 정책
+        for k, v in attrs.items():
+            try:
+                # span은 ReadWriteSpan (SDK span)이라 set_attribute 가능
+                # 만약 이미 있으면 건너뜀
+                span_attributes = getattr(span, "attributes", None)
+                if isinstance(span_attributes, dict) and k in span_attributes:
+                    continue
+                span.set_attribute(k, v)
+            except Exception:
+                # 안전하게: 주입 실패해도 tracing 파이프라인을 깨지 않음
+                pass
+
+        # 기존 store 방식과 맞추기 위해, rollout/attempt 컨텍스트 안에서
+        # 단조 증가 sequence_id를 span attribute(`agentlightning.span_sequence_id`)로 기록한다.
+        try:
+            seq_key = LightningResourceAttributes.SPAN_SEQUENCE_ID.value
+            span_attributes = getattr(span, "attributes", None)
+            if isinstance(span_attributes, dict) and seq_key in span_attributes:
+                return
+
+            # kh: convert to string because 0 is falsy and we want to allow it as a valid sequence ID
+            # span.set_attribute(seq_key, str(self._local_sequence_id))
+            # self._local_sequence_id += 1        # kh: opposite sequence_id assignment compared to non-langfuse
+
+            # print(f"ON_START _local_sequence_id={self._local_sequence_id} for span={span.name} rollout={self._rollout_id} attempt={self._attempt_id}")
+        except Exception:
+            pass

@@ -37,12 +37,24 @@ __all__ = [
     "is_reward_span",
     "find_reward_spans",
     "find_final_reward",
+    "get_intermediate_reward_value",
+    "is_intermediate_reward_span",
+    "find_intermediate_reward_spans",
+    "find_final_intermediate_reward",
 ]
 
 
 class RewardSpanData(TypedDict):
     type: Literal["reward"]
     value: Optional[float]
+
+
+class IntermediateRewardSpanData(TypedDict):
+    type: Literal["intermediate_reward"]
+    value: Optional[float]
+
+
+INTERMEDIATE_REWARD_SPAN_NAME = "agentlightning.intermediate_reward"
 
 
 FnType = TypeVar("FnType", bound=Callable[..., Any])
@@ -207,6 +219,76 @@ def is_reward_span(span: SpanLike) -> bool:
     """Return ``True`` when the provided span encodes a reward value."""
     maybe_reward = get_reward_value(span)
     return maybe_reward is not None
+
+
+def get_intermediate_reward_value(span: SpanLike) -> Optional[float]:
+    """Extract intermediate reward value from a span, if available.
+
+    Intermediate reward is intentionally kept separate from final reward and is
+    recognized by either:
+
+    - AgentOps payload with ``{"type": "intermediate_reward", "value": ...}``
+    - Dedicated span name ``agentlightning.intermediate_reward`` with attributes
+      ``intermediate.score`` (preferred) or ``reward`` (fallback)
+    """
+    for key in [
+        "agentops.task.output",
+        "agentops.entity.output",
+    ]:
+        reward_dict: Dict[str, Any] | None = None
+        if span.attributes:
+            output = span.attributes.get(key)
+            if output:
+                if isinstance(output, dict):
+                    reward_dict = cast(Dict[str, Any], output)
+                elif isinstance(output, str):
+                    try:
+                        reward_dict = cast(Dict[str, Any], json.loads(output))
+                    except json.JSONDecodeError:
+                        reward_dict = None
+
+        if reward_dict and reward_dict.get("type") == "intermediate_reward":
+            reward_value = reward_dict.get("value", None)
+            if reward_value is None:
+                return None
+            if not isinstance(reward_value, (float, int)):
+                logger.error(
+                    f"Intermediate reward is not a number, got: {type(reward_value)}. This may cause undefined behaviors."
+                )
+                return None
+            return float(reward_value)
+
+    if span.name == INTERMEDIATE_REWARD_SPAN_NAME and span.attributes:
+        reward_value = span.attributes.get("intermediate.score", span.attributes.get("reward", None))
+        if reward_value is None:
+            return None
+        if not isinstance(reward_value, (float, int)):
+            logger.error(
+                f"Intermediate reward is not a number, got: {type(reward_value)}. This may cause undefined behaviors."
+            )
+            return None
+        return float(reward_value)
+    return None
+
+
+def is_intermediate_reward_span(span: SpanLike) -> bool:
+    """Return ``True`` when the provided span encodes an intermediate reward value."""
+    maybe_reward = get_intermediate_reward_value(span)
+    return maybe_reward is not None
+
+
+def find_intermediate_reward_spans(spans: Sequence[SpanLike]) -> List[SpanLike]:
+    """Return all intermediate reward spans in the provided sequence."""
+    return [span for span in spans if is_intermediate_reward_span(span)]
+
+
+def find_final_intermediate_reward(spans: Sequence[SpanLike]) -> Optional[float]:
+    """Return the last intermediate reward value present in the provided spans."""
+    for span in reversed(spans):
+        reward = get_intermediate_reward_value(span)
+        if reward is not None:
+            return reward
+    return None
 
 
 def find_reward_spans(spans: Sequence[SpanLike]) -> List[SpanLike]:

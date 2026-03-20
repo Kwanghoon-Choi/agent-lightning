@@ -1,12 +1,10 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-import asyncio
-import multiprocessing
 import os
-import time
-from multiprocessing.synchronize import Event as MpEvent
-from typing import Any, Dict, Optional, cast
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Awaitable, Dict, Optional, cast
 
+import litellm
 import openai
 import pytest
 
@@ -24,19 +22,38 @@ from ..common.tracer import clear_tracer_provider
 from ..common.vllm import VLLM_AVAILABLE, RemoteOpenAIServer
 
 
-async def init_runner(
-    agent: LitAgent[Any],
-    *,
-    resources: Optional[Dict[str, LLM]] = None,
-) -> tuple[LitAgentRunner[Any], InMemoryLightningStore]:
-    store = InMemoryLightningStore()
-    llm_resource: NamedResources = resources or {"llm": LLM(endpoint="http://localhost", model="dummy")}  # type: ignore[assignment]
-    await store.update_resources("default", llm_resource)
+class InitRunnerFunction:
 
-    runner = LitAgentRunner[Any](tracer=AgentOpsTracer(), poll_interval=0.01)
-    runner.init(agent)
-    runner.init_worker(worker_id=0, store=store)
-    return runner, store
+    def __call__(
+        self,
+        agent: LitAgent[Any],
+        *,
+        resources: Optional[Dict[str, LLM]] = None,
+    ) -> Awaitable[tuple[LitAgentRunner[Any], InMemoryLightningStore]]: ...
+
+
+@pytest.fixture(
+    params=[
+        pytest.param("agentops", marks=pytest.mark.agentops),
+    ]
+)
+def init_runner(request: pytest.FixtureRequest) -> InitRunnerFunction:
+    async def init_runner_fn(
+        agent: LitAgent[Any],
+        *,
+        resources: Optional[Dict[str, LLM]] = None,
+    ) -> tuple[LitAgentRunner[Any], InMemoryLightningStore]:
+        store = InMemoryLightningStore()
+        llm_resource: NamedResources = resources or {"llm": LLM(endpoint="http://localhost", model="dummy")}  # type: ignore[assignment]
+        await store.update_resources("default", llm_resource)
+
+        # This is always AgentOpsTracer for now
+        runner = LitAgentRunner[Any](tracer=AgentOpsTracer(), poll_interval=0.01)
+        runner.init(agent)
+        runner.init_worker(worker_id=0, store=store)
+        return runner, store
+
+    return init_runner_fn  # type: ignore
 
 
 def teardown_runner(runner: LitAgentRunner[Any]) -> None:
@@ -46,12 +63,15 @@ def teardown_runner(runner: LitAgentRunner[Any]) -> None:
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_module():
+    # This must execute only once for this module.
+    # Once agentops tracer is initialized, it cannot be reset,
+    # otherwise it will never be rewired.
     clear_tracer_provider()
     yield
 
 
 @pytest.mark.asyncio
-async def test_runner_integration_basic_rollout() -> None:
+async def test_runner_integration_basic_rollout(init_runner: InitRunnerFunction) -> None:
     class EchoAgent(LitAgent[str]):
         async def validation_rollout_async(self, task: str, resources: Dict[str, Any], rollout: Any) -> None:
             emit_reward(1.0)
@@ -67,16 +87,12 @@ async def test_runner_integration_basic_rollout() -> None:
     assert rollouts and rollouts[0].status == "succeeded"
     attempts = await store.query_attempts(rollouts[0].rollout_id)
     spans = await store.query_spans(rollouts[0].rollout_id, attempts[-1].attempt_id)
-    print(store.__dict__)
-    assert any(span.attributes.get("reward") == 1.0 for span in spans)
+    assert any(span.attributes.get("agentlightning.reward.0.value") == 1.0 for span in spans)
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not (os.getenv("OPENAI_BASE_URL") and os.getenv("OPENAI_API_KEY")),
-    reason="OpenAI endpoint or key not configured",
-)
-async def test_runner_integration_with_openai() -> None:
+@pytest.mark.openai
+async def test_runner_integration_with_openai(init_runner: InitRunnerFunction) -> None:
     class OpenAIAgent(LitAgent[str]):
         async def validation_rollout_async(self, task: str, resources: NamedResources, rollout: Rollout) -> float:
             llm = cast(LLM, resources["llm"])
@@ -87,6 +103,9 @@ async def test_runner_integration_with_openai() -> None:
             )
             assert response.choices, "OpenAI response should contain choices"
             return 0.0
+
+    if not (os.getenv("OPENAI_BASE_URL") and os.getenv("OPENAI_API_KEY")):
+        raise RuntimeError("OpenAI endpoint or key not configured")
 
     base_url = os.environ["OPENAI_BASE_URL"]
     api_key = os.environ["OPENAI_API_KEY"]
@@ -105,22 +124,24 @@ async def test_runner_integration_with_openai() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.openai
 @pytest.mark.skipif(
     not (os.getenv("OPENAI_BASE_URL") and os.getenv("OPENAI_API_KEY")),
     reason="OpenAI endpoint or key not configured",
 )
-async def test_runner_integration_with_litellm_proxy() -> None:
-    litellm = pytest.importorskip("litellm")
-
+async def test_runner_integration_with_litellm_proxy(init_runner: InitRunnerFunction) -> None:
     class LiteLLMAgent(LitAgent[str]):
         def validation_rollout(self, task: str, resources: NamedResources, rollout: Rollout) -> float:
             llm = cast(LLM, resources["llm"])
-            response = litellm.completion(
+            response = litellm.completion(  # type: ignore
                 model=llm.model,
                 messages=[{"role": "user", "content": task}],
             )
-            assert response.get("choices"), "litellm proxy should return choices"
+            assert response.get("choices"), "litellm proxy should return choices"  # type: ignore
             return 0.0
+
+    if not (os.getenv("OPENAI_BASE_URL") and os.getenv("OPENAI_API_KEY")):
+        raise RuntimeError("OpenAI endpoint or key not configured")
 
     agent = LiteLLMAgent()
     resources = {"llm": LLM(endpoint="http://dummy", model="openai/gpt-4o-mini")}
@@ -154,12 +175,26 @@ def server():
         yield server
 
 
-@pytest.mark.asyncio
-async def test_runner_integration_with_spawned_litellm_proxy(server: RemoteOpenAIServer) -> None:
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("GPU not available")
+class LLMProxyWithClearedTracerProvider(LLMProxy):
+    """LLMProxy that clears the tracer provider before serving.
 
+    It will be run in a separate process, so the tracer provider initialized there does not
+    interfere with the main process's tracer provider.
+    """
+
+    @asynccontextmanager
+    async def _serve_context(self) -> AsyncGenerator[None, None]:
+        # This will be run inside the LLM proxy's own process
+        clear_tracer_provider()
+        async with super()._serve_context():
+            yield
+
+
+@pytest.mark.asyncio
+@pytest.mark.gpu
+async def test_runner_integration_with_spawned_litellm_proxy(
+    init_runner: InitRunnerFunction, server: RemoteOpenAIServer
+) -> None:
     class ProxyAgent(LitAgent[str]):
         async def validation_rollout_async(self, task: str, resources: NamedResources, rollout: Rollout) -> float:
             attempted_rollout = cast(AttemptedRollout, rollout)
@@ -182,7 +217,7 @@ async def test_runner_integration_with_spawned_litellm_proxy(server: RemoteOpenA
     await server_store.start()
     client_store = LightningStoreClient(server_store.endpoint)
 
-    proxy = LLMProxy(
+    proxy = LLMProxyWithClearedTracerProvider(
         port=get_free_port(),
         model_list=[
             {
@@ -196,16 +231,7 @@ async def test_runner_integration_with_spawned_litellm_proxy(server: RemoteOpenA
         store=client_store,
     )
 
-    def run_proxy_server(proxy: LLMProxy, event: MpEvent):
-        clear_tracer_provider()
-        proxy.start()
-        event.set()
-        time.sleep(3600)  # Keep the server running
-
-    event = multiprocessing.Event()
-    process = multiprocessing.Process(target=run_proxy_server, args=(proxy, event))
-    process.start()
-    event.wait(timeout=30)
+    await proxy.start()
 
     try:
         await runner.step("Say hello to Agent Lightning", resources={"llm": proxy.as_resource()})
@@ -214,6 +240,7 @@ async def test_runner_integration_with_spawned_litellm_proxy(server: RemoteOpenA
         assert rollouts and rollouts[0].status == "succeeded"
 
         spans = await client_store.query_spans(rollouts[0].rollout_id, "latest")
+        assert len(spans) > 1
         first_spans = [span for span in spans if span.sequence_id == 1]
         assert len(first_spans) > 1
         assert any("llm.hosted_vllm.choices" in span.attributes for span in first_spans)
@@ -226,13 +253,12 @@ async def test_runner_integration_with_spawned_litellm_proxy(server: RemoteOpenA
 
         last_spans = [span for span in spans if span.sequence_id == max(span.sequence_id for span in spans)]
         assert len(last_spans) == 1
-        assert last_spans[0].name == "agentlightning.reward"
-        assert last_spans[0].attributes.get("reward") == 0.5
+        assert last_spans[0].name == "agentlightning.annotation"
+        assert (
+            last_spans[0].attributes.get("agentlightning.reward.0.value") == 0.5
+        ), f"Expected reward to be 0.5, found {last_spans[0].attributes}"
     finally:
         teardown_runner(runner)
-        process.terminate()
+        await proxy.stop()
         await client_store.close()
         await server_store.stop()
-        await asyncio.to_thread(process.join, timeout=1)
-        if process.is_alive():
-            process.kill()

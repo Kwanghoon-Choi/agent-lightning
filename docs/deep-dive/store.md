@@ -1,8 +1,8 @@
 # Understanding Store
 
-The **[`LightningStore`][agentlightning.LightningStore]** is the central coordination point for Agent-lightning. It holds the task queue, rollouts, attempts, spans, and versioned resources, and exposes a small API both Runners and Algorithms use to communicate. This document explains what’s in the store, how statuses transition, how spans are recorded, and the concurrency model (threads & processes).
+The **[`LightningStore`][agentlightning.LightningStore]** is the central coordination point for Agent-lightning. It holds the task queue, rollouts, attempts, spans, and versioned resources, and exposes a small API both Runners and Algorithms use to communicate. This document explains what's in the store, how statuses transition, how spans are recorded, and the concurrency model (threads & processes).
 
-## What’s in the Store?
+## What's in the Store?
 
 ![Store Architecture](../assets/store-api-visualized.svg){ .center }
 
@@ -13,12 +13,11 @@ At a high level:
 * **Attempts** – Each rollout can have multiple executions (retries). Attempts track [`status`][agentlightning.Attempt.status], [`start_time`][agentlightning.Attempt.start_time], [`end_time`][agentlightning.Attempt.end_time], [`last_heartbeat_time`][agentlightning.Attempt.last_heartbeat_time] and link to spans. Valid [AttemptStatus][agentlightning.AttemptStatus] are `preparing`, `running`, `succeeded`, `failed`, `requeuing`, `cancelled`.
 * **Spans** – Structured trace events produced by the Tracer during an attempt. Spans are ordered by a **monotonic sequence id** per `(rollout_id, attempt_id)`.
 * **Resources** – Versioned, named bundles (e.g., prompt templates) referenced by rollouts.
+* **Workers** – Metadata about runner instances: heartbeat timestamps, current assignment, and status.
 
-Rollout and Task share the same surface in practice: [`Rollout.input`][agentlightning.types.Rollout] is the task input. The queue stores rollouts that are not yet running; [Runners][agentlightning.Runner] dequeue them and update the same rollout’s status as work progresses.
+Rollout and Task share the same surface in practice: [`Rollout.input`][agentlightning.types.Rollout] is the task input. The queue stores rollouts that are not yet running; [Runners][agentlightning.Runner] dequeue them and update the same rollout's status as work progresses.
 
-All [`LightningStore`][agentlightning.LightningStore] implementations must inherit from [`LightningStore`][agentlightning.LightningStore] and override the methods to implement the storage logic.
-
-Before we look at status transitions, it helps to keep in mind that rollouts are the “outside view,” while attempts are the “inside view.” Attempts are what actually run; rollouts summarize the latest attempt plus a small set of control actions like queueing and cancellation.
+Before we look at status transitions, it helps to keep in mind that rollouts are the "outside view," while attempts are the "inside view." Attempts are what actually run; rollouts summarize the latest attempt plus a small set of control actions like queueing and cancellation.
 
 ## Attempt Status Transitions
 
@@ -72,6 +71,15 @@ Each attempt begins in **preparing**, created either when a rollout is dequeued 
 
 This simple model allows the system to distinguish between normal termination, abnormal stalling, and recoverable interruption without additional state flags.
 
+## Worker Telemetry
+
+Workers track runner-level activity timestamps (`last_heartbeat_time`, `last_dequeue_time`, `last_busy_time`, `last_idle_time`) plus their current rollout assignment. Those fields are now derived automatically:
+
+- [`dequeue_rollout(worker_id=...)`][agentlightning.LightningStore.dequeue_rollout] records which worker polled the queue and refreshes `last_dequeue_time`.
+- [`update_attempt(..., worker_id=...)`][agentlightning.LightningStore.update_attempt] drives the worker status machine. Assigning an attempt marks the worker **busy** and stamps `last_busy_time`; finishing with `status in {"succeeded","failed"}` switches to **idle**, while watchdog transitions such as `timeout`/`unresponsive` make the worker **unknown** and clear `current_rollout_id` / `current_attempt_id`.
+- [`update_worker(...)`][agentlightning.LightningStore.update_worker] is reserved for heartbeats. It snapshots optional `heartbeat_stats` and always updates `last_heartbeat_time`.
+
+Because every transition flows through these APIs, worker status is derived automatically from rollout execution and heartbeats. Note, however, that calling `update_worker` with a new `worker_id` will create a new worker record with status "unknown" if one does not exist. Thus, while manual status changes are not allowed, new worker records can be created externally via heartbeats.
 
 ## Rollout Transition Map
 
@@ -108,7 +116,7 @@ rollout = await store.enqueue_rollout(input, config=cfg)
 | ------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | N/A                                   | `queuing`                                 | Created by `enqueue_rollout()`.                                                                   |
 | `preparing`                           | `queuing/requeuing` → `preparing`         | Typically `dequeue_rollout()` or `start_rollout()`/`start_attempt()` creates a new attempt.       |
-| `running`                             | `preparing/queuing/requeuing` → `running` | First `add_[otel_]span()` flips the attempt to `running`; rollout follows via `propagate_status`. |
+| `running`                             | `preparing/queuing/requeuing` → `running` | First `add_[otel_]span()` flips the attempt to `running`; rollout follows via `rollout_status_from_attempt`. |
 | `succeeded`                           | `*` → `succeeded`                         | Terminal. Rollout `end_time` set.                                                                 |
 | `failed` / `timeout` / `unresponsive` | `*` → `requeuing`                         | **Only if** `status ∈ retry_condition ∧ sequence_id < max_attempts`.                              |
 | `failed` / `timeout` / `unresponsive` | `*` → `failed`                            | Otherwise (no retries left or retries disabled).                                                  |
@@ -116,7 +124,7 @@ rollout = await store.enqueue_rollout(input, config=cfg)
 
 !!! note "Why aggregation?"
 
-    In code, we use `propagate_status()` which actively updates the rollout based on the latest attempt. Reading the table above is usually easier than reverse-engineering the propagation logic in the code: think of the rollout’s transitions as *callbacks* on attempt state changes, plus queue/cancel paths.
+    In code, we use `rollout_status_from_attempt()` which actively updates the rollout based on the latest attempt. Reading the table above is usually easier than reverse-engineering the propagation logic in the code: think of the rollout’s transitions as *callbacks* on attempt state changes, plus queue/cancel paths.
 
 ## Spans
 
@@ -143,22 +151,220 @@ Programmatically this is encapsulated by [`Span.from_opentelemetry(readable_span
 
     [`add_span`][agentlightning.LightningStore.add_span] or [`add_otel_span`][agentlightning.LightningStore.add_otel_span] both appends a span *and* acts as a heartbeat that can revive `unresponsive` → `running`.
 
-## Store Implementations
+### OTLP Compatibility
 
-Currently, the only out-of-the-box implementation is [`InMemoryLightningStore`][agentlightning.InMemoryLightningStore]:
+Some of the LightningStore implementations support exporting traces via the [OTLP/HTTP specification](https://opentelemetry.io/docs/specs/otlp/). For example, [`LightningStoreServer`][agentlightning.LightningStoreServer] exposes `/v1/traces` endpoint, it implements the binary Protobuf variant defined by the spec, including the required `Content-Type: application/x-protobuf`, optional `Content-Encoding: gzip`, and status responses encoded as `google.rpc.Status`. Agent-lightning helps parsing `ExportTraceServiceRequest` messages, validate identifiers, normalize resource metadata, and allocate sequence numbers so store implementations only need to persist [`Span`][agentlightning.Span] objects in order.
 
-- Fast startup, zero external dependencies, and ideal for local development, CI, and unit tests.
-- Fully asyncio-safe for writes; most reader operations can iterate without locks, except those that need to perform multiple queries.
-- Includes a best-effort span eviction policy once memory crosses a configured watermark; querying evicted spans raises a clear error so callers can fall back.
+Because the interface speaks standard OTLP, any OpenTelemetry-compatible SDK or collector can emit spans directly to a LightningStore OTLP endpoint without custom shims. The server responds according to the OTLP contract (status code, encoding, and error payloads), which keeps Agent-lightning interoperable with existing observability tooling. This compatibility serves as a strong complement to the OpenTelemetry conversion discussed above.
 
-For production you will likely want persistence. We’re actively building a SQLite-backed store that keeps the same API surface while adding durability, crash recovery, and better historical span queries. If you need something sooner, implement your own store by subclassing [`LightningStore`][agentlightning.LightningStore] and providing concrete storage for the small set of abstract methods (`enqueue_rollout`, `dequeue_rollout`, `update_attempt`, `add_span`, etc.). This document plus the tests in `tests/store/` illustrate the expected behavior.
+Check whether the store supports OTLP traces via the [`capabilities["otlp_traces"]`][agentlightning.LightningStore.capabilities] property.
+
+## Implementation Overview
+
+The `agentlightning.store` module is organized into two distinct layers plus optional wrappers:
+
+```mermaid
+classDiagram
+    direction TB
+
+    class LightningStore {
+        <<abstract>>
+        +enqueue_rollout()
+        +dequeue_rollout()
+        +update_attempt()
+        +add_span()
+        +query_rollouts()
+        ...
+    }
+
+    class LightningCollections {
+        <<abstract>>
+        +rollouts: Collection
+        +attempts: Collection
+        +spans: Collection
+        +resources: Collection
+        +workers: Collection
+        +rollout_queue: Queue
+        +span_sequence_ids: KeyValue
+        +atomic()
+    }
+
+    class CollectionBasedLightningStore~T~ {
+        +collections: T
+        -healthcheck_before()
+        -tracked()
+    }
+
+    class InMemoryLightningStore
+    class MongoLightningStore
+    class InMemoryLightningCollections
+    class MongoLightningCollections
+
+    class LightningStoreServer {
+        +store: LightningStore
+        +start()
+        +stop()
+    }
+    class LightningStoreClient {
+        +server_address: str
+    }
+    class LightningStoreThreaded {
+        +store: LightningStore
+    }
+
+    LightningStore <|-- CollectionBasedLightningStore
+    LightningStore <|-- LightningStoreServer
+    LightningStore <|-- LightningStoreClient
+    LightningStore <|-- LightningStoreThreaded
+
+    CollectionBasedLightningStore <|-- InMemoryLightningStore
+    CollectionBasedLightningStore <|-- MongoLightningStore
+
+    LightningCollections <|-- InMemoryLightningCollections
+    LightningCollections <|-- MongoLightningCollections
+
+    InMemoryLightningStore ..> InMemoryLightningCollections : uses
+    MongoLightningStore ..> MongoLightningCollections : uses
+
+    LightningStoreServer o-- LightningStore : wraps
+    LightningStoreThreaded o-- LightningStore : wraps
+```
+
+1. **Collections Layer** – Low-level storage primitives ([`LightningCollections`][agentlightning.store.collection.LightningCollections]) providing CRUD operations via [`Collection`][agentlightning.store.collection.Collection], [`Queue`][agentlightning.store.collection.Queue], and [`KeyValue`][agentlightning.store.collection.KeyValue] interfaces. Each backend (in-memory, MongoDB) implements these primitives.
+
+2. **Store Layer** – All [`LightningStore`][agentlightning.LightningStore] implementations must inherit from [`LightningStore`][agentlightning.LightningStore] and override the methods to implement the storage logic. [`CollectionBasedLightningStore`][agentlightning.CollectionBasedLightningStore] builds on collections to implement the full [`LightningStore`][agentlightning.LightningStore] API, including business logic like status transitions, watchdog health checks, and retry policies.
+
+3. **Wrappers** – Cross-cutting concerns live in thin wrappers:
+    - [`LightningStoreThreaded`][agentlightning.LightningStoreThreaded] adds mutex-based thread safety.
+    - [`LightningStoreServer`][agentlightning.LightningStoreServer] / [`LightningStoreClient`][agentlightning.LightningStoreClient] enable multi-process access over HTTP.
+
+## Collections
+
+The collections layer provides storage primitives that [`CollectionBasedLightningStore`][agentlightning.CollectionBasedLightningStore] builds upon. This separation keeps business logic (status transitions, watchdog, retries) in the store layer while allowing different backends to focus purely on persistence.
+
+The off-the-shelf implementations are [`InMemoryLightningCollections`][agentlightning.store.collection.InMemoryLightningCollections] and [`MongoLightningCollections`][agentlightning.store.collection.mongo.MongoLightningCollections], which are the underlying collections for [`InMemoryLightningStore`][agentlightning.InMemoryLightningStore] and [`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore], respectively.
+
+### Collection Primitives
+
+[`LightningCollections`][agentlightning.store.collection.LightningCollections] bundles three primitive types:
+
+| Primitive | Purpose | Methods |
+|-----------|---------|---------|
+| [`Collection[T]`][agentlightning.store.collection.Collection] | Indexed storage with primary keys | [`query()`][agentlightning.store.collection.Collection.query], [`get()`][agentlightning.store.collection.Collection.get], [`insert()`][agentlightning.store.collection.Collection.insert], [`update()`][agentlightning.store.collection.Collection.update], [`upsert()`][agentlightning.store.collection.Collection.upsert], [`delete()`][agentlightning.store.collection.Collection.delete] |
+| [`Queue[T]`][agentlightning.store.collection.Queue] | FIFO queue for task scheduling | [`enqueue()`][agentlightning.store.collection.Queue.enqueue], [`dequeue()`][agentlightning.store.collection.Queue.dequeue], [`peek()`][agentlightning.store.collection.Queue.peek], [`size()`][agentlightning.store.collection.Queue.size] |
+| [`KeyValue[K, V]`][agentlightning.store.collection.KeyValue] | Simple key-value store | [`get()`][agentlightning.store.collection.KeyValue.get], [`set()`][agentlightning.store.collection.KeyValue.set], [`inc()`][agentlightning.store.collection.KeyValue.inc], [`chmax()`][agentlightning.store.collection.KeyValue.chmax], [`pop()`][agentlightning.store.collection.KeyValue.pop] |
+
+Every [`LightningCollections`][agentlightning.store.collection.LightningCollections] instance exposes these named collections:
+
+- `rollouts` – [`Collection[Rollout]`][agentlightning.store.collection.Collection] keyed by `rollout_id`
+- `attempts` – [`Collection[Attempt]`][agentlightning.store.collection.Collection] keyed by `(rollout_id, attempt_id)`
+- `spans` – [`Collection[Span]`][agentlightning.store.collection.Collection] keyed by `(rollout_id, attempt_id, span_id)`
+- `resources` – [`Collection[ResourcesUpdate]`][agentlightning.store.collection.Collection] keyed by `resources_id`
+- `workers` – [`Collection[Worker]`][agentlightning.store.collection.Collection] keyed by `worker_id`
+- `rollout_queue` – [`Queue[str]`][agentlightning.store.collection.Queue] holding rollout IDs awaiting execution
+- `span_sequence_ids` – [`KeyValue[str, int]`][agentlightning.store.collection.KeyValue] tracking monotonic sequence counters
+
+### Atomic Operations
+
+Collections support atomic operations through the [`atomic()`][agentlightning.store.collection.LightningCollections.atomic] context manager:
+
+```python
+async with collections.atomic(mode="rw", labels=["rollouts", "attempts"]) as ctx:
+    rollout = await ctx.rollouts.get(filter={"rollout_id": {"exact": rollout_id}})
+    # modify and update within the same transaction
+    await ctx.rollouts.update([updated_rollout])
+```
+
+The arguments passed to [`atomic()`][agentlightning.store.collection.LightningCollections.atomic] are quite arbitrary and flexible. Different implementations may have different interpretations of the arguments. For example, to [`InMemoryLightningCollections`][agentlightning.store.collection.InMemoryLightningCollections], the `mode` parameter controls locking behavior (`"r"` for read-only, `"rw"` for read-write), while `labels` specifies which collections to lock. Acquiring locks in sorted order prevents deadlocks when multiple operations run concurrently.
+
+### Implementing a Custom Backend
+
+To add a new storage backend, implement [`LightningCollections`][agentlightning.store.collection.LightningCollections]:
+
+```python
+from agentlightning.store.collection import LightningCollections, Collection, Queue, KeyValue
+
+class MyLightningCollections(LightningCollections):
+    @property
+    def rollouts(self) -> Collection[Rollout]:
+        return self._rollouts  # your implementation
+
+    @property
+    def rollout_queue(self) -> Queue[str]:
+        return self._queue  # your implementation
+
+    # ... implement remaining properties
+
+    async def atomic(self, *, mode, snapshot=False, labels=None, **kwargs):
+        # provide transaction / locking semantics
+        ...
+```
+
+Then instantiate your store:
+
+```python
+from agentlightning.store.collection_based import CollectionBasedLightningStore
+
+store = CollectionBasedLightningStore(collections=MyLightningCollections())
+```
+
+The store layer handles all business logic; your collections just need to provide correct CRUD semantics.
+
+## Collection-based Store Implementations
+
+Agent-lightning ships with two collection-based store implementations:
+
+### InMemoryLightningStore
+
+[`InMemoryLightningStore`][agentlightning.InMemoryLightningStore] uses [`InMemoryLightningCollections`][agentlightning.store.collection.InMemoryLightningCollections] backed by Python data structures. It supports **fast startup** with zero external dependencies—ideal for local development, CI, and unit tests. It also provides two lock modes, configurable between `"asyncio"` (single-thread, multiple coroutines) and `"thread"` (multi-threaded via [aiologic](https://github.com/x42005e1f/aiologic)).
+[`InMemoryLightningCollections`][agentlightning.store.collection.InMemoryLightningCollections] use nested dictionaries for O(1) primary-key lookup and `deque` for the task queue.
+
+### MongoLightningStore
+
+[`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore] uses [`MongoLightningCollections`][agentlightning.store.collection.mongo.MongoLightningCollections] backed by MongoDB. It supports **persistent storage** suitable for production deployments and **multi-process safe** via database-level atomicity. It also supports **partition support** via `partition_id` for running multiple trainers against the same database.
+
+```python
+from agentlightning.store.mongo import MongoLightningStore
+
+store = MongoLightningStore(
+    mongo_uri="mongodb://localhost:27017/?replicaSet=rs0",
+    database_name="agentlightning",
+    partition_id="trainer-1",  # optional: isolate data per trainer
+)
+```
+
+!!! note
+
+    [`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore] requires the `mongo` optional dependency. Install with `pip install agentlightning[mongo]`.
+
+### Capabilities
+
+[](){ #store-capabilities }
+
+Different stores have different capabilities. Check the [`capabilities`][agentlightning.LightningStore.capabilities] property to understand what a store supports:
+
+| Capability | Description | InMemory | Mongo | Server | Client |
+|------------|-------------|----------|-------|--------|--------|
+| `thread_safe` | Safe for concurrent access from multiple threads | configurable | ✓ | ✓ | ✓ |
+| `async_safe` | Safe for concurrent access from multiple coroutines | ✓ | ✓ | ✓ | ✓ |
+| `zero_copy` | Can be shared across processes without serialization | ✗ | ✓ | ✓ | ✓ |
+| `otlp_traces` | Exposes an OTLP-compatible `/v1/traces` endpoint | ✗ | ✗ | ✓ | ✓ |
 
 ## Thread Safety
 
-**[`LightningStoreThreaded`][agentlightning.LightningStoreThreaded]** is a subclass of [`LightningStore`][agentlightning.LightningStore] that wraps another underlying store to make a store instance safe for multi-threaded callers. It wraps every state-mutating call in a mutex. Specifically:
+Thread safety can be achieved at different layers:
+
+**At the collections layer**: [`InMemoryLightningCollections`][agentlightning.store.collection.InMemoryLightningCollections] accepts a `lock_type` parameter:
+
+- `"asyncio"` – Uses per-event-loop `asyncio.Lock` for single-threaded, multi-coroutine scenarios.
+- `"thread"` – Uses `aiologic.Lock` for true multi-threaded access.
+
+**At the store layer**: [`LightningStoreThreaded`][agentlightning.LightningStoreThreaded] wraps any [`LightningStore`][agentlightning.LightningStore] to add mutex-based thread safety:
 
 * Methods like [`start_rollout`][agentlightning.LightningStore.start_rollout], [`enqueue_rollout`][agentlightning.LightningStore.enqueue_rollout], [`update_attempt`][agentlightning.LightningStore.update_attempt], [`add_span`][agentlightning.LightningStore.add_span], etc. are guarded by a lock.
-* Non-mutating, potentially blocking calls remain pass-through by design (e.g., [`wait_for_rollouts`][agentlightning.LightningStore.wait_for_rollouts]), as they don’t modify shared state and should not hold the lock for long periods.
+* Non-mutating, potentially blocking calls remain pass-through by design (e.g., [`wait_for_rollouts`][agentlightning.LightningStore.wait_for_rollouts]), as they don't modify shared state and should not hold the lock for long periods.
+
+Database-based stores like [`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore] are inherently thread-safe through database atomicity guarantees.
 
 ## Process Safety and Client-server Store
 
@@ -170,7 +376,7 @@ For production you will likely want persistence. We’re actively building a SQL
 
 The server tracks the creator PID. In the owner process it delegates directly to the in-memory store; in other processes it lazily constructs a [`LightningStoreClient`][agentlightning.LightningStoreClient] to talk to the HTTP API. This prevents accidental cross-process mutation of the wrong memory image. When the server is pickled (e.g., via `multiprocessing`), only the minimal fields are serialized, but **NOT** the FastAPI/uvicorn objects. Subprocesses won’t accidentally carry live server state. Forked subprocess should also use [`LightningStoreClient`][agentlightning.LightningStoreClient] to communicate with the server in the main process.
 
-On the client side, the client retries network/5xx failures using a small backoff, and probes `/health` between attempts. Application exceptions inside the server are wrapped as HTTP 400 with a traceback—these are **not retried**. The client also maintains a **per-event-loop** `aiohttp.ClientSession` map so that tracer callbacks (often on separate loops/threads) don’t hang by reusing a session from another loop.
+On the client side, the client retries network/5xx failures using a small backoff, and probes `/v1/agl/health` between attempts. Application exceptions inside the server are wrapped as HTTP 400 with a traceback—these are **not retried**. The client also maintains a **per-event-loop** `aiohttp.ClientSession` map so that tracer callbacks (often on separate loops/threads) don’t hang by reusing a session from another loop.
 
 Minimal lifecycle:
 
@@ -187,7 +393,7 @@ await server.start()      # starts uvicorn in a daemon thread and waits for /hea
 # Client (same or different process)
 client = agl.LightningStoreClient("http://localhost:4747")
 
-print(await client.query_rollouts(status=["queuing"]))
+print(await client.query_rollouts(status_in=["queuing"]))
 
 await client.close()
 await server.stop()

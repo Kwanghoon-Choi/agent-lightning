@@ -5,11 +5,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, List, Literal, Optional
 
 from agentlightning.types import Attempt, Dataset, Rollout, RolloutStatus, Span
 
 from .base import Algorithm
+from .utils import with_llm_proxy, with_store
+
+if TYPE_CHECKING:
+    from agentlightning.llm_proxy import LLMProxy
+    from agentlightning.store.base import LightningStore
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,8 @@ class Baseline(FastAlgorithm):
     The baseline algorithm batches task submissions, waits for each rollout to
     finish, and logs every collected span and reward. It is primarily useful as
     a smoke test for the platform plumbing rather than a performant trainer.
+
+    The baseline algorithm will auto-start a LLM proxy if one is provided and not yet started.
 
     Args:
         n_epochs: Number of dataset passes to execute for both the train and val
@@ -128,11 +135,13 @@ class Baseline(FastAlgorithm):
         # Attempts to adapt the spans using the adapter if provided
         try:
             adapter = self.get_adapter()
+        except ValueError:
+            logger.warning("No adapter set for MockAlgorithm. Skipping trace adaptation.")
+            adapter = None
+        if adapter is not None:
             spans = await store.query_spans(rollout_id=rollout_id, attempt_id="latest")
             transformed_data = adapter.adapt(spans)
             logger.info(f"[Rollout {rollout_id}] Adapted data: {transformed_data}")
-        except ValueError:
-            logger.warning("No adapter set for MockAlgorithm. Skipping trace adaptation.")
 
     async def _enqueue_rollouts(
         self, dataset: Dataset[Any], train_indices: List[int], val_indices: List[int], resources_id: str
@@ -141,7 +150,7 @@ class Baseline(FastAlgorithm):
         store = self.get_store()
 
         for index in train_indices + val_indices:
-            queuing_rollouts = await store.query_rollouts(status=["queuing", "requeuing"])
+            queuing_rollouts = await store.query_rollouts(status_in=["queuing", "requeuing"])
             if len(queuing_rollouts) <= 1:
                 # Only enqueue a new rollout when there is at most 1 rollout in the queue.
                 sample = dataset[index]
@@ -178,8 +187,12 @@ class Baseline(FastAlgorithm):
 
             await asyncio.sleep(self.polling_interval)
 
+    @with_llm_proxy()
+    @with_store
     async def run(
         self,
+        store: LightningStore,  # Injected by decorator - callers should not provide this parameter
+        llm_proxy: Optional[LLMProxy],  # Injected by decorator - callers should not provide this parameter
         train_dataset: Optional[Dataset[Any]] = None,
         val_dataset: Optional[Dataset[Any]] = None,
     ) -> None:
@@ -200,8 +213,6 @@ class Baseline(FastAlgorithm):
         logger.debug(f"Train indices: {train_indices}")
         logger.debug(f"Val indices: {val_indices}")
 
-        store = self.get_store()
-
         # Currently we only supports a single resource update at the start.
         initial_resources = self.get_initial_resources()
         if initial_resources is not None:
@@ -220,7 +231,7 @@ class Baseline(FastAlgorithm):
                     f"Processing index {index}. {len(train_indices)} train indices and {len(val_indices)} val indices in total."
                 )
                 while True:
-                    queuing_rollouts = await store.query_rollouts(status=["queuing", "requeuing"])
+                    queuing_rollouts = await store.query_rollouts(status_in=["queuing", "requeuing"])
                     if len(queuing_rollouts) <= self.max_queue_length:
                         # Only enqueue a new rollout when there is at most "max_queue_length" rollout in the queue.
                         sample = concatenated_dataset[index]

@@ -10,20 +10,25 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterator,
     List,
     Literal,
+    Mapping,
     Optional,
     Protocol,
+    Sequence,
     SupportsIndex,
+    TypedDict,
     TypeVar,
     Union,
     cast,
+    overload,
 )
 
 from opentelemetry.sdk.trace import ReadableSpan
 from pydantic import BaseModel, Field, model_validator
 
-from .tracer import Span
+from .tracer import Span, SpanCoreFields
 
 if TYPE_CHECKING:
     from agentlightning.litagent import LitAgent
@@ -48,7 +53,14 @@ __all__ = [
     "Rollout",
     "Attempt",
     "AttemptedRollout",
+    "EnqueueRolloutRequest",
     "Hook",
+    "Worker",
+    "WorkerStatus",
+    "PaginatedResult",
+    "FilterOptions",
+    "SortOptions",
+    "FilterField",
 ]
 
 T_co = TypeVar("T_co", covariant=True)
@@ -200,6 +212,50 @@ class AttemptedRollout(Rollout):
         return self
 
 
+class EnqueueRolloutRequest(BaseModel):
+    """Payload describing a rollout to be queued via [`enqueue_rollout`][agentlightning.LightningStore.enqueue_rollout].
+
+    A subset of fields from [`Rollout`][agentlightning.Rollout] used for queuing new rollouts.
+    """
+
+    input: TaskInput
+    """Task input used to generate the rollout."""
+    mode: Optional[RolloutMode] = None
+    """Execution mode such as `"train"`, `"val"` or `"test"`. See [`RolloutMode`][agentlightning.RolloutMode]."""
+    resources_id: Optional[str] = None
+    """Identifier of the resources required to execute the rollout."""
+    config: Optional[RolloutConfig] = None
+    """Retry and timeout configuration associated with the rollout."""
+    metadata: Optional[Dict[str, Any]] = None
+    """Additional metadata attached to the rollout."""
+
+
+WorkerStatus = Literal["idle", "busy", "unknown"]
+
+
+class Worker(BaseModel):
+    """Worker information. This is actually the same as Runner info."""
+
+    worker_id: str
+    """The ID of the worker."""
+    status: WorkerStatus = "unknown"
+    """The status of the worker."""
+    heartbeat_stats: Optional[Dict[str, Any]] = None
+    """Statistics about the worker's heartbeat."""
+    last_heartbeat_time: Optional[float] = None
+    """The last time when the worker has reported the stats."""
+    last_dequeue_time: Optional[float] = None
+    """The last time when the worker has tried to dequeue a rollout."""
+    last_busy_time: Optional[float] = None
+    """The last time when the worker has started an attempt and became busy."""
+    last_idle_time: Optional[float] = None
+    """The last time when the worker has triggered the end of an attempt and became idle."""
+    current_rollout_id: Optional[str] = None
+    """The ID of the current rollout that the worker is processing."""
+    current_attempt_id: Optional[str] = None
+    """The ID of the current attempt that the worker is processing."""
+
+
 TaskInput = Any
 """Task input type. Accepts arbitrary payloads."""
 
@@ -251,6 +307,7 @@ RolloutRawResult = Union[
     float,  # only final reward
     List[ReadableSpan],  # constructed OTEL spans by user
     List[Span],  # constructed Span objects by user
+    List[SpanCoreFields],  # constructed SpanCoreFields objects by user
 ]
 """Rollout result type.
 
@@ -393,3 +450,104 @@ class Hook(ParallelWorkerBase):
         Subclasses can override this method for cleanup or additional
         logging. By default, this is a no-op.
         """
+
+
+class FilterField(TypedDict, total=False):
+    """An operator dict for a single field."""
+
+    exact: Any
+    within: Sequence[Any]
+    contains: str
+
+
+FilterOptions = Mapping[
+    Union[str, Literal["_aggregate", "_must"]],
+    Union[FilterField, Literal["and", "or"], Mapping[str, FilterField]],
+]
+"""A mapping of field name -> operator dict.
+
+Each operator dict can contain:
+
+- "exact": value for exact equality.
+- "within": iterable of allowed values.
+- "contains": substring to search for in string fields.
+
+The filter can also have a special field called "_aggregate" that can be used to specify the logic
+to combine the results of the filters:
+
+- "and": all conditions must match. This is the default value if not specified.
+- "or": at least one condition must match.
+
+All conditions within a field and between different fields are
+stored in a unified pool and combined using `_aggregate`.
+
+The filter can also have a special group called "_must", which is a mapping of filters that must all match,
+no matter whether the aggregate logic is "and" or "or".
+
+Example:
+
+```json
+{
+    "_aggregate": "or",
+    "_must": {
+        "city": {"exact": "New York"},
+        "timezone": {"within": ["America/New_York", "America/Los_Angeles"]},
+    },
+    "status": {"exact": "active"},
+    "id": {"within": [1, 2, 3]},
+    "name": {"contains": "foo"},
+}
+```
+"""
+
+
+class SortOptions(TypedDict):
+    """Options for sorting the collection."""
+
+    name: str
+    """The name of the field to sort by."""
+    order: Literal["asc", "desc"]
+    """The order to sort by."""
+
+
+T_item = TypeVar("T_item")
+
+
+class PaginatedResult(BaseModel, Sequence[T_item]):
+    """Result of a paginated query.
+
+    Behaves like a sequence, but also carries pagination metadata (limit, offset, total).
+    """
+
+    items: Sequence[T_item]
+    """Items in the result."""
+    limit: int
+    """Limit of the result."""
+    offset: int
+    """Offset of the result."""
+    total: int
+    """Total number of items in the collection."""
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    @overload
+    def __getitem__(self, index: int) -> T_item: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[T_item]: ...
+
+    def __getitem__(self, index: Union[int, slice]) -> Union[T_item, Sequence[T_item]]:
+        return self.items[index]
+
+    # Overriding __iter__ enables list(paginated_result) to work as expected,
+    # but changes Pydantic's default dict iteration behavior (which would otherwise
+    # iterate over field names).
+    def __iter__(self) -> Iterator[T_item]:  # type: ignore
+        return iter(self.items)
+
+    def __repr__(self) -> str:
+        first_item_repr = repr(self.items[0]) if self.items else "empty"
+        items_repr = f"[{first_item_repr}, ...]" if len(self.items) > 1 else first_item_repr
+        slice_repr = f"{self.offset}:" if self.limit == -1 else f"{self.offset}:{self.offset + self.limit}"
+        return f"<PaginatedResult ({slice_repr} of {self.total}) {items_repr}>"

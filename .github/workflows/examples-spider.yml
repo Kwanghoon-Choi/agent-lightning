@@ -8,35 +8,32 @@ on:
 
   workflow_dispatch:
 
-  pull_request:
-    types: [reopened, ready_for_review]
+  repository_dispatch:
+    types: [ci-spider, ci-all]
+
+run-name: >-
+  ${{ github.event_name == 'repository_dispatch'
+      && format(
+        'Spider - PR #{0} - {1} - {2}',
+        github.event.client_payload.pull_number,
+        github.event.client_payload.ci_label,
+        github.event.client_payload.correlation_id
+      )
+      || format('Spider - {0}', github.event_name) }}
 
 jobs:
-  label-check:
-    runs-on: ubuntu-latest
-    outputs:
-      should-run: ${{ steps.evaluate.outputs.should-run }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Decide whether to run
-        id: evaluate
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const evaluateTrigger = require('./scripts/trigger_on_label.js');
-            evaluateTrigger({ core, context, labelName: 'ci-spider' });
-
   spider:
-    needs: label-check
-    if: needs.label-check.outputs.should-run == 'true'
+    if: >
+      github.event_name != 'repository_dispatch' ||
+      github.event.action == 'ci-spider' ||
+      github.event.action == 'ci-all'
     name: Spider (Python ${{ matrix.python-version }}, ${{ matrix.setup-script }})
     runs-on: [self-hosted, 1ES.Pool=agl-runner-gpu]
     timeout-minutes: 60
     strategy:
       matrix:
         include:
-        - python-version: '3.10'
-          setup-script: 'legacy'
+        # legacy is omitted because langchain doesn't work with legacy vllm versions
         - python-version: '3.12'
           setup-script: 'stable'
         - python-version: '3.13'
@@ -47,7 +44,9 @@ jobs:
         run: nvidia-smi
       - name: Check disk space
         run: df -h
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.pr_ref || (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.ref }}
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -58,13 +57,13 @@ jobs:
       - name: Sync dependencies (latest)
         run: |
           uv sync --frozen --no-default-groups --extra verl \
-            --group dev --group experiment --group agents --group torch-gpu-stable
+            --group dev --group experiment --group agents --group langchain --group torch-gpu-stable
         if: matrix.setup-script == 'latest'
-      - name: Sync dependencies (stable & legacy)
+      - name: Sync dependencies (stable)
         run: |
           uv sync --frozen --no-default-groups --extra verl \
-            --group dev --group experiment --group agents --group torch-gpu-${{ matrix.setup-script }}
-        if: matrix.setup-script != 'latest'
+            --group dev --group experiment --group agents --group langchain --group torch-gpu-${{ matrix.setup-script }}
+        if: matrix.setup-script == 'stable'
       - name: Freeze dependencies
         run: |
           set -ex
@@ -72,7 +71,7 @@ jobs:
           echo "UV_LOCKED=1" >> $GITHUB_ENV
           echo "UV_NO_SYNC=1" >> $GITHUB_ENV
       - name: Upload dependencies artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dependencies-spider-${{ matrix.python-version }}-${{ matrix.setup-script }}
           path: requirements-freeze.txt
@@ -82,8 +81,8 @@ jobs:
         run: |
           ./scripts/litellm_run.sh
         env:
-          AZURE_API_BASE: ${{ secrets.AZURE_API_BASE }}
-          AZURE_API_KEY: ${{ secrets.AZURE_API_KEY }}
+          AZURE_API_BASE: ${{ secrets.AZURE_GROUP_SUBSCRIPTION_API_BASE }}
+          AZURE_API_KEY: ${{ secrets.AZURE_GROUP_SUBSCRIPTION_API_KEY }}
 
       - name: Prepare Spider dataset
         run: |
@@ -121,7 +120,7 @@ jobs:
       - name: Validate Spider training
         run: |
           set -ex
-          uv run scripts/validate_example_wandb.py ${{ steps.spider_train.outputs.project_name }} ${{ steps.spider_train.outputs.run_name }}
+          uv run scripts/validate_example_wandb.py ${{ steps.spider_train.outputs.project_name }} ${{ steps.spider_train.outputs.run_name }} --reward-tolerance 5
         env:
           WANDB_BASE_URL: ${{ secrets.MSR_WANDB_BASE_URL }}
           WANDB_API_KEY: ${{ secrets.MSR_WANDB_API_KEY }}

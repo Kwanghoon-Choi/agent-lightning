@@ -8,7 +8,7 @@ from typing import cast
 
 from apo_custom_algorithm import apo_rollout
 
-from agentlightning import Trainer, configure_logger
+from agentlightning import Trainer, setup_logging
 from agentlightning.litagent import LitAgent
 from agentlightning.runner import LitAgentRunner
 from agentlightning.store import InMemoryLightningStore
@@ -80,7 +80,7 @@ async def debug_with_hooks():
 
 
 def debug_with_trainer():
-    """This appraoch integrates the trainer and is very similar to the real `fit()` loop.
+    """This approach integrates the trainer and is very similar to the real `fit()` loop.
 
     The trainer will create a mock algorithm which will communicates with the runner.
     Do this for end-to-end testing and debugging purposes.
@@ -105,7 +105,7 @@ def debug_with_trainer():
 
 
 if __name__ == "__main__":
-    configure_logger()
+    setup_logging()
 
     parser = argparse.ArgumentParser(description="Debug APO with runner or trainer approach.")
     parser.add_argument(

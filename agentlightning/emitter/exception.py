@@ -1,46 +1,54 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 import logging
-import traceback
+from typing import Any, Dict, Optional
 
-from opentelemetry.semconv.attributes import exception_attributes
-
-from agentlightning.types import SpanNames
-
-from .utils import get_tracer
+from agentlightning.semconv import AGL_EXCEPTION
+from agentlightning.tracer.base import get_active_tracer
+from agentlightning.tracer.dummy import DummyTracer
+from agentlightning.types import TraceStatus
+from agentlightning.utils.otel import flatten_attributes, format_exception_attributes, sanitize_attributes
 
 logger = logging.getLogger(__name__)
 
 
-def emit_exception(exception: BaseException) -> None:
+def emit_exception(
+    exception: BaseException, attributes: Optional[Dict[str, Any]] = None, propagate: bool = True
+) -> None:
     """Record an exception with OpenTelemetry metadata.
+
+    Classic OpenTelemetry records exceptions in a dedicated logging service.
+    We simplify the model and use trace spans to record exceptions as well.
 
     Args:
         exception: Raised exception instance to serialize into telemetry attributes.
+        attributes: Additional attributes to attach to the exception span.
+        propagate: Whether to propagate the span to exporters automatically.
 
     !!! note
-        The helper validates its input. Non-exception values are ignored to prevent
-        noisy telemetry and indicate programming mistakes via the logger.
+
+        The helper validates its input. If a non-exception value is provided,
+        a TypeError is raised to indicate a programming mistake.
     """
     if not isinstance(exception, BaseException):  # type: ignore
-        logger.error(f"Expected an BaseException instance, got: {type(exception)}. Skip emit_exception.")
-        return
+        raise TypeError(f"Expected a BaseException instance, got: {type(exception)}.")
+    span_attributes = format_exception_attributes(exception)
 
-    tracer = get_tracer()
-    stacktrace = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
-    attributes = {
-        exception_attributes.EXCEPTION_TYPE: type(exception).__name__,
-        exception_attributes.EXCEPTION_MESSAGE: str(exception),
-        exception_attributes.EXCEPTION_ESCAPED: True,
-    }
-    if stacktrace.strip():
-        attributes[exception_attributes.EXCEPTION_STACKTRACE] = stacktrace
+    if attributes:
+        flattened = flatten_attributes(attributes, expand_leaf_lists=False)
+        span_attributes.update(sanitize_attributes(flattened))
 
-    span = tracer.start_span(
-        SpanNames.EXCEPTION.value,
-        attributes=attributes,
-    )
     logger.debug("Emitting exception span for %s", type(exception).__name__)
-    with span:
-        span.record_exception(exception)
-        # We don't set the status of the span here. They have other semantics.
+
+    if propagate:
+        tracer = get_active_tracer()
+        if tracer is None:
+            raise RuntimeError("No active tracer found. Cannot emit exception span.")
+    else:
+        tracer = DummyTracer()
+    tracer.create_span(
+        AGL_EXCEPTION,
+        attributes=span_attributes,
+        # The exception span is successful by itself.
+        status=TraceStatus(status_code="OK"),
+    )

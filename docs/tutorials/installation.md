@@ -34,7 +34,7 @@ This installs or upgrades Agent-Lightning to the newest stable version.
 Agent-Lightning also publishes **nightly builds**, which contain the latest experimental features and improvements from the main branch. These are available via **Test PyPI**.
 
 ```bash
-pip install --upgrade --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ agentlightning
+pip install --upgrade --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ --pre agentlightning
 ```
 
 !!! warning
@@ -151,6 +151,18 @@ uv sync --frozen \
 ```
 
 Read more about Agent-lightning managed dependency groups [here]({{ src("pyproject.toml") }}).
+
+### Building the Dashboard
+
+The Agent-Lightning dashboard is built using [Vite](https://vite.dev/). To build the dashboard, run the following command:
+
+```bash
+cd dashboard
+npm ci
+npm run build
+```
+
+Some HTML and JavaScript assets will be generated in the `agentlightning/dashboard` directory.
 
 ### Activating Your Environment
 

@@ -16,7 +16,7 @@ jobs:
       tag_version: ${{ steps.get_tag.outputs.tag_version }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get version from pyproject.toml
         id: get_version
@@ -48,7 +48,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: actions/setup-python@v6
@@ -59,6 +59,14 @@ jobs:
           enable-cache: true
       - name: Sync dependencies
         run: uv sync --frozen --no-default-groups --group dev
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Install JavaScript dependencies
+        run: cd dashboard && npm ci
+      - name: Build dashboard
+        run: cd dashboard && npm run build
 
       - name: Build package
         run: |

@@ -1,4 +1,4 @@
-# Scaling out Algorithms and Rollouts
+# Scaling out Agent-lightning
 
 Agent-lightning splits training into an **algorithm bundle** and a **runner bundle** that exchange work through the [`LightningStore`][agentlightning.LightningStore]. This tutorial shows how to increase rollout throughput, place bundles across processes or machines, and keep the algorithm side scalable with external frameworks.
 
@@ -167,6 +167,39 @@ Set `AGL_SERVER_HOST` and `AGL_SERVER_PORT` if you prefer environment-based conf
 
 Algorithms sometimes require heterogeneous computation resources, such as GPU accelerators, while runners sometimes require a specific environment to run because many agent frameworks are fragile in their dependencies. A role-based launch pattern helps you place the algorithm on a dedicated machine with more GPU memory, while runners can live on another machine with more flexible dependencies. This is possible via `AGL_CURRENT_ROLE="algorithm"` or `AGL_CURRENT_ROLE="runner"` environment variables. When running on different machines, you also need to set `AGL_SERVER_HOST` and `AGL_SERVER_PORT` to the IP address and port of the algorithm machine. You might recognize that this convention is very similar to `MASTER_ADDR` and `MASTER_PORT` in [PyTorch distributed training](https://docs.pytorch.org/docs/stable/notes/ddp.html).
 
+### Launching Algorithm and Runner Roles on Separate Machines
+
+When you want to stretch the algorithm onto a GPU-rich machine and keep rollout workers close to the data source (or on machines with a more permissive dependency stack), launch the same training script in different terminals with role-specific environment variables. The client–server strategy will route each process to the right side of the queue as long as they share the same `AGL_SERVER_HOST`/`AGL_SERVER_PORT` pair.
+
+**1. Pick an address and port for the store.** Decide which machine will host the algorithm. Choose a TCP port that can be reached by the runner machines (for example, open it in your firewall configuration). In this example we will use `10.0.0.4:4747`.
+
+**2. Start the algorithm process.** On the machine that should run the algorithm, expose the store by binding to all network interfaces and mark the role as `algorithm`.
+
+```bash
+export AGL_SERVER_HOST=0.0.0.0
+export AGL_SERVER_PORT=4747
+export AGL_CURRENT_ROLE=algorithm
+
+python train_calc_agent.py
+```
+
+Leaving `AGL_MANAGED_STORE` unset (or setting it to `1`) lets the strategy create the [`LightningStoreServer`][agentlightning.LightningStoreServer] for you. Otherwise, you can use the method in the previous section to create a store on your own.
+
+**3. Start rollout workers on remote machines.** Every runner machine should point to the algorithm host and declare itself as the `runner` role. You can start multiple processes per machine or repeat the command on additional hosts.
+
+```bash
+export AGL_SERVER_HOST=10.0.0.4
+export AGL_SERVER_PORT=4747
+export AGL_CURRENT_ROLE=runner
+python train_calc_agent.py --n-runners 4
+```
+
+The runner process automatically connects via [`LightningStoreClient`][agentlightning.LightningStoreClient]. Adjust `--n-runners` to spawn the desired number of worker processes on that machine.
+
+**4. Scale out as needed.** Repeat step 3 on as many machines as you need. When you are done, stop the algorithm process. However, since the runners are on different machines, the strategy WILL NOT send a cooperative stop signal to the connected runners. So you need to kill the runners on your own.
+
+This role-based launch mirrors what [`Trainer.fit`][agentlightning.Trainer.fit] does inside a single machine while letting you spread work across a fleet. Because every process shares the same training script, you keep a single source of truth for dataset loading, adapters, and tracers, but you can tune compute resources independently for the algorithm and rollout workers.
+
 ### Shared-memory Strategy
 
 [`SharedMemoryExecutionStrategy`][agentlightning.SharedMemoryExecutionStrategy] keeps everything inside one process. The runner runs on the main thread (by default) while the algorithm lives on a Python thread guarded by [`LightningStoreThreaded`][agentlightning.LightningStoreThreaded].
@@ -193,3 +226,109 @@ Agent-lightning strives to make algorithms’ own parallelization work well unde
 !!! note
 
     The [birds' eye view][birds-eye-view-client-server-strategy] illustrates how adapters, proxies, and stores interact when the algorithm spawns additional workers. Use that diagram as a checklist when introducing new distributed components.
+
+## Parallelizing [`LightningStore`][agentlightning.LightningStore]
+
+By default, Agent-lightning persists rollouts and spans in an in-memory store. [`Trainer.fit`][agentlightning.Trainer.fit] spins it up automatically, or you can launch it yourself via the [`agl store` command](../reference/cli.md). [`InMemoryLightningStore`][agentlightning.InMemoryLightningStore] keeps all state inside the current process, which makes local iteration fast but introduces two production constraints:
+
+1. Spans are evicted once the process crosses its memory cap, so long runs risk data loss unless the host has abundant RAM.
+2. Although the store is well optimized via asynchronous programming, the store lives in a single process and remains bound by the GIL, preventing it from saturating multi-core machines.
+
+!!! note "General note for all server-client stores"
+
+    If your algorithm and runners communicate through HTTP protocol (which should be the default for 99% of the cases), you need to ensure the file limit is sufficiently large to avoid the "Too many open files" error. You can set the file limit by running the following command:
+
+    ```bash
+    ulimit -n 100000
+    ```
+
+For resilient runs, switch to a persistent backend such as [`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore], which writes data to MongoDB instead of local RAM. Agent-lightning relies on [pymongo](https://pymongo.readthedocs.io/en/stable/) to interact with MongoDB, which can be installed via:
+
+```bash
+pip install agentlightning[mongo]
+```
+
+To use the MongoDB store, you need to pass the MongoDB URI to the store constructor. The URI should be in the format of `mongodb://<host>:<port>/<database>?replicaSet=<replicaSet>`.
+
+```python
+from agentlightning.store.mongo import MongoLightningStore
+
+trainer = agl.Trainer(
+    algorithm=algorithm,
+    store=MongoLightningStore(mongo_uri="mongodb://localhost:27017/?replicaSet=rs0"),
+)
+```
+
+!!! tip "Setting up MongoDB"
+
+    MongoDB is a popular document-oriented database. Before running Agent-lightning with [`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore], make sure that you've already had a MongoDB instance running. Setting up can be conveniently done via Docker Compose via [compose.mongo.yml]({{ src("docker/compose.mongo.yml") }}). Unless targeting serious production use, we recommend creating the data folders and setting them to `777` permission to avoid permission issues.
+
+    ```bash
+    mkdir -p data/mongo-host
+    chmod 777 data/mongo-host
+    docker compose -f compose.mongo.yml up -d
+    ```
+
+    Alternatively, you can also install MongoDB manually following the [official documentation](https://www.mongodb.com/docs/manual/installation/). If you installed MongoDB manually, an important note is that you need to ensure that the MongoDB instance has enabled replica set feature, since Agent-lightning uses the transactional operations internally. The simplest approach is to use the following script (executed in the MongoDB shell) to initialize the replica set:
+
+    ```javascript
+    rs.initiate({
+      _id: "rs0",
+      members: [{ _id: 0, host: "localhost:27017" }],
+    });
+    ```
+
+To scale out further, launch the store server via [`agl store --backend mongo`](../reference/cli.md) (see [Debugging with External Store][debug-with-external-store]). The CLI accepts `--n-workers`, which starts the server under `gunicorn` with multiple worker processes so concurrent runners can push and pull at higher throughput. This option applies only to persistent backends; an in-memory store, on the other hand, cannot be sharded across workers because its state lives inside one process.
+
+!!! note
+
+    The `--n-workers` here is the number of worker processes for the store server, NOT related to the number of rollout runners.
+
+## Increasing Throughput of LLM Proxy
+
+Agent-lightning includes an optional [`LLMProxy`][agentlightning.LLMProxy] that wraps [LiteLLM](https://docs.litellm.ai/) to provide a unified OpenAI-compatible endpoint for your agents. When rollout throughput increases, the proxy can become a bottleneck. You can scale it out using the same pattern as the store server.
+
+To increase proxy throughput, pass `num_workers` when constructing the proxy:
+
+```python
+import agentlightning as agl
+
+proxy = agl.LLMProxy(
+    port=4000,
+    launch_mode="mp",  # multiprocessing mode
+    num_workers=4,  # four gunicorn workers handle concurrent requests
+)
+```
+
+You can also configure the proxy through [`Trainer`][agentlightning.Trainer]:
+
+```python
+trainer = agl.Trainer(
+    algorithm=algorithm,
+    n_runners=8,  # The runners here is the rollout runners, not related to LLM proxy replicas
+    llm_proxy={"port": 4000, "num_workers": 4},  # launch mode is actually mp by default
+)
+```
+
+When `num_workers > 1`, the launcher starts gunicorn with the specified number of worker processes. Each worker runs its own event loop, allowing the proxy to handle many concurrent LLM requests without being blocked by Python's GIL.
+
+!!! tip
+
+    When using `mp` launch mode, [`LLMProxy`][agentlightning.LLMProxy] will start the server in a separate process. To make sure the proxy is still accessing the same store as the main process, you need to set the store to be [zero-copy compatible][store-capabilities], which means, either the store is a native zero-copy store like [`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore] or the store is wrapped via [`LightningStoreServer`][agentlightning.LightningStoreServer] or [`LightningStoreClient`][agentlightning.LightningStoreClient].
+
+!!! note "Shared Server Infrastructure"
+
+    Both [`LightningStoreServer`][agentlightning.LightningStoreServer] and [`LLMProxy`][agentlightning.LLMProxy] rely on a common utility called [`PythonServerLauncherArgs`][agentlightning.utils.server_launcher.PythonServerLauncherArgs]. This dataclass captures the settings needed to launch a FastAPI application:
+
+    ```python
+    from agentlightning.utils import PythonServerLauncherArgs
+
+    args = PythonServerLauncherArgs(
+        port=8000,
+        host="0.0.0.0",
+        n_workers=4,          # spawn 4 gunicorn workers
+        launch_mode="thread", # or "mp" for multiprocessing, "asyncio" for in-loop
+    )
+    ```
+
+    Under the hood, [`PythonServerLauncher`][agentlightning.utils.server_launcher.PythonServerLauncher] reads these arguments and chooses between uvicorn (single worker) and gunicorn (multiple workers) automatically.

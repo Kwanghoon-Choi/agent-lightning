@@ -2,6 +2,42 @@
 
 When you train your own agent with Agent-lightning, most failures surface because the agent logic is brittle or simply incorrect. Debugging becomes easier when you peel back the stack: start by driving the rollout logic on its own, dry-run the trainer loop, and only then bring the full algorithm and runner topology online. The [`examples/apo/apo_debug.py`]({{ src("examples/apo/apo_debug.py") }}) script demonstrates these techniques; this guide expands on each approach and helps you decide when to reach for them.
 
+## Debugging with Dashboard
+
+When you launch an experiment with [`Trainer.fit`][agentlightning.Trainer.fit] or start an isolated store via [`agl store`](../reference/cli.md), the terminal prints a message similar to:
+
+```text
+INFO     Agent-lightning dashboard will be available at http://192.168.0.107:4747
+```
+
+Visit that URL, and you will see the Agent-lightning dashboard:
+
+![Dashboard](../assets/dashboard-page-rollouts.png)
+
+The dashboard surfaces everything stored inside [the store](../deep-dive/store.md). Because the store mediates interactions between algorithms and runners, inspecting it often reveals which side is causing issues such as stale rollouts, unresponsive workers, or empty traces.
+
+For example, the VERL algorithm may receive no token IDs and emit `cannot reshape tensor of 0 elements into shape [1, 0, -1, 128] because the unspecified dimension size -1 can be any value and is ambiguous` ([Issue #50](https://github.com/microsoft/agent-lightning/issues/50), [Issue #76](https://github.com/microsoft/agent-lightning/issues/76)). Several scenarios can produce that error: the runner might not produce trace spans at all, it might produce spans without token IDs, or the IDs may be present but formatted incorrectly. Inspecting the dashboard traces helps you pinpoint which condition applies.
+
+![Dashboard Traces Page](../assets/dashboard-page-traces.png)
+
+By checking whether the trace span is empty and whether token IDs appear in the span attributes, you can narrow the issue to either the runner (agent) side or the algorithm side. Then apply the techniques below to debug the faulty component.
+
+## Debug-level Logging
+
+Starting from v0.3, detailed signals such as store server access logs, runner lifecycle logs, and span payloads only appear when the log level is `DEBUG` so the default output stays readable. Enable debug-level logging by adding the following snippet near the top of your script:
+
+```python
+import agentlightning as agl
+
+agl.setup_logging("DEBUG")
+```
+
+Set the log level on every process if your setup involves multiple workers. For example, when [running stores in isolation][debug-with-external-store], configure the store process explicitly:
+
+```bash
+agl store --port 4747 --log-level DEBUG
+```
+
 ## Using [`Runner`][agentlightning.Runner] in Isolation
 
 [`Runner`][agentlightning.Runner] is a long-lived worker that wraps your [`LitAgent`][agentlightning.LitAgent], coordinates tracing, and talks to the [`LightningStore`][agentlightning.LightningStore]. In typical training flows the trainer manages runners for you, but being able to spin one up manually is invaluable while debugging.
@@ -43,7 +79,7 @@ Example output (with a reward span captured):
 
 ```python
 [Rollout(rollout_id='ro-519769241af8', input='Explain why the sky appears blue using principles of light scattering in 100 words.', start_time=1760706315.6996238, ..., status='succeeded')]
-[Span(rollout_id='ro-519769241af8', attempt_id='at-a6b62caf', sequence_id=1, ..., name='agentlightning.reward', attributes={'reward': 0.95}, ...)]
+[Span(rollout_id='ro-519769241af8', attempt_id='at-a6b62caf', sequence_id=1, ..., name='agentlightning.annotation', attributes={'agentlightning.reward.0.value': 0.95}, ...)]
 ```
 
 Swap in an [`AgentOpsTracer`][agentlightning.AgentOpsTracer] instead of [`OtelTracer`][agentlightning.OtelTracer] to see the underlying LLM spans alongside reward information:
@@ -52,7 +88,7 @@ Swap in an [`AgentOpsTracer`][agentlightning.AgentOpsTracer] instead of [`OtelTr
 [
     Span(rollout_id='ro-519769241af8', attempt_id='at-a6b62caf', sequence_id=1, ..., name='openai.chat.completion', attributes={..., 'gen_ai.prompt.0.role': 'user', 'gen_ai.prompt.0.content': 'You are a helpful assistant. Explain why the sky appears blue using principles of light scattering in 100 words.', ...}),
     Span(rollout_id='ro-519769241af8', attempt_id='at-a6b62caf', sequence_id=2, ..., name='openai.chat.completion', attributes={..., 'gen_ai.prompt.0.role': 'user', 'gen_ai.prompt.0.content': 'Evaluate how well the output fulfills the task...', ...}),
-    Span(rollout_id='ro-519769241af8', attempt_id='at-a6b62caf', sequence_id=3, ..., name='agentlightning.reward', attributes={'reward': 0.95}, ...)
+    Span(rollout_id='ro-519769241af8', attempt_id='at-a6b62caf', sequence_id=3, ..., name='agentlightning.annotation', attributes={'agentlightning.reward.0.value': 0.95}, ...)
 ]
 ```
 
@@ -65,6 +101,67 @@ Swap in an [`AgentOpsTracer`][agentlightning.AgentOpsTracer] instead of [`OtelTr
 !!! tip
 
     You can also call [`Runner.step`][agentlightning.Runner.step] to inject ad-hoc rollouts into a running store being used by another algorithm, so that the rollouts can be consumed by the algorithms. This is very recently known as the paradigm of ["online RL"](https://cursor.com/blog/tab-rl). At the moment, no algorithm in the [algorithm zoo](../algorithm-zoo/index.md) consumes externally generated rollouts, but the data flow is available there if you need it.
+
+## Debug with LLM Proxy
+
+If you are dealing with LLM optimization like Reinforcement Learning, we generally recommend using an online stable LLM service for your debugging purposes, like `openai/gpt-4.1-nano`. After the debugging is done, you can switch to a local training endpoint.
+
+However, if you want to use a local LLM features like [getting the token IDs](../deep-dive/serving-llm.md), you can also manually start a local vLLM server by:
+
+```bash
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --port 8080
+```
+
+Then start the LLM proxy via the following script:
+
+```python
+import asyncio
+import aiohttp
+import agentlightning as agl
+
+async def serve_llm_proxy():
+    store = agl.InMemoryLightningStore()
+    store_server = agl.LightningStoreServer(store, "127.0.0.1", 8081)
+    await store_server.start()
+
+    llm_proxy = agl.LLMProxy(
+        port=8082,
+        model_list=[
+            {
+                "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+                "litellm_params": {
+                    "model": "hosted_vllm/Qwen/Qwen2.5-0.5B-Instruct",
+                    "api_base": "http://localhost:8080/v1",
+                },
+            }
+        ],
+        store=store_server,
+    )
+
+    await llm_proxy.start()
+    await asyncio.sleep(1000000)
+```
+
+Test the served LLM proxy with a client like:
+
+```python
+async def test_llm_proxy():
+    async with aiohttp.ClientSession() as session:
+        async with session.post("http://localhost:8082/v1/chat/completions", json={
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",
+            "messages": [{"role": "user", "content": "Hello, world!"}],
+        }) as response:
+            print(await response.json())
+```
+
+You can now use the LLM proxy by specifying environment variables:
+
+```bash
+export OPENAI_API_BASE=http://localhost:8081/v1
+export OPENAI_API_KEY=dummy
+```
+
+You might see warnings about `Missing or invalid rollout_id, attempt_id, or sequence_id` in the LLM proxy logs. This is fine because you don't have a rollout and attempt yet when you are debugging. When you started the training, the algorithm will create the rollouts for you and the warnings will go away.
 
 ## Hook into Runner's Lifecycle
 
@@ -159,7 +256,7 @@ Just like [`Runner.run_context`][agentlightning.Runner.run_context], [`Trainer.d
 21:20:35 [Rollout ro-302fb202bd85 | Attempt 1] ID: at-f84ad21c. Status: succeeded. Worker: Worker-0
 21:20:35 [Rollout ro-302fb202bd85 | Attempt at-f84ad21c | Span 3a286a856af6bea8] #1 (openai.chat.completion) ... 1.95 seconds. Attribute keys: ['gen_ai.request.type', 'gen_ai.system', ...]
 21:20:35 [Rollout ro-302fb202bd85 | Attempt at-f84ad21c | Span e2f44b775e058dd6] #2 (openai.chat.completion) ... 1.24 seconds. Attribute keys: ['gen_ai.request.type', 'gen_ai.system', ...]
-21:20:35 [Rollout ro-302fb202bd85 | Attempt at-f84ad21c | Span 45ee3c94fa1070ec] #3 (agentlightning.reward) ... 0.00 seconds. Attribute keys: ['reward']
+21:20:35 [Rollout ro-302fb202bd85 | Attempt at-f84ad21c | Span 45ee3c94fa1070ec] #3 (agentlightning.annotation) ... 0.00 seconds. Attribute keys: ['agentlightning.reward.0.value']
 21:20:35 [Rollout ro-302fb202bd85] Adapted data: [Triplet(prompt={'token_ids': []}, response={'token_ids': []}, reward=None, metadata={'response_id': '...', 'agent_name': ''}), Triplet(prompt={'token_ids': []}, response={'token_ids': []}, reward=0.95, metadata={'response_id': '...', 'agent_name': ''})]
 21:20:35 Finished 1 rollouts.
 21:20:35 [Rollout ro-e65a3ffaa540] Status changed to preparing.
@@ -167,7 +264,7 @@ Just like [`Runner.run_context`][agentlightning.Runner.run_context], [`Trainer.d
 21:20:40 [Rollout ro-e65a3ffaa540 | Attempt 1] ID: at-eaefa5d4. Status: succeeded. Worker: Worker-0
 21:20:40 [Rollout ro-e65a3ffaa540 | Attempt at-eaefa5d4 | Span 901dd6acc0f50147] #1 (openai.chat.completion) ... 1.30 seconds. Attribute keys: ['gen_ai.request.type', 'gen_ai.system', ...]
 21:20:40 [Rollout ro-e65a3ffaa540 | Attempt at-eaefa5d4 | Span 52e0aa63e02be611] #2 (openai.chat.completion) ... 1.26 seconds. Attribute keys: ['gen_ai.request.type', 'gen_ai.system', ...]
-21:20:40 [Rollout ro-e65a3ffaa540 | Attempt at-eaefa5d4 | Span 6c452de193fbffd3] #3 (agentlightning.reward) ... 0.00 seconds. Attribute keys: ['reward']
+21:20:40 [Rollout ro-e65a3ffaa540 | Attempt at-eaefa5d4 | Span 6c452de193fbffd3] #3 (agentlightning.annotation) ... 0.00 seconds. Attribute keys: ['agentlightning.reward.0.value']
 21:20:40 [Rollout ro-e65a3ffaa540] Adapted data: [Triplet(prompt={'token_ids': []}, response={'token_ids': []}, reward=None, metadata={'response_id': '...', 'agent_name': ''}), Triplet(prompt={'token_ids': []}, response={'token_ids': []}, reward=1.0, metadata={'response_id': '...', 'agent_name': ''})]
 21:20:40 Finished 2 rollouts.
 ```
@@ -193,6 +290,8 @@ In a separate terminal, start the store:
 ```bash
 agl store --port 4747
 ```
+
+Add `--log-level DEBUG` to the command to see the detailed logs.
 
 Then, in your training script, create a [`LightningStoreClient`][agentlightning.LightningStoreClient] and pass it to the trainer:
 

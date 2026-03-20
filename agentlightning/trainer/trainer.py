@@ -114,6 +114,9 @@ class Trainer(TrainerLegacy):
     or a dictionary with the initialization parameters for the exporter.
     Deprecated. Use [`adapter`][agentlightning.Trainer.adapter] instead."""
 
+    port: Optional[int]
+    """Port forwarded to [`ClientServerExecutionStrategy`][agentlightning.ClientServerExecutionStrategy]."""
+
     def __init__(
         self,
         *,
@@ -126,6 +129,7 @@ class Trainer(TrainerLegacy):
         store: ComponentSpec[LightningStore] = None,
         runner: ComponentSpec[Runner[Any]] = None,
         strategy: ComponentSpec[ExecutionStrategy] = None,
+        port: Optional[int] = None,
         algorithm: ComponentSpec[Algorithm] = None,
         llm_proxy: ComponentSpec[LLMProxy] = None,
         n_workers: Optional[int] = None,
@@ -139,11 +143,22 @@ class Trainer(TrainerLegacy):
         Each keyword accepts either a concrete instance, a class, a callable factory, a
         registry string, or a lightweight configuration dictionary (see
         [`build_component()`][agentlightning.trainer.init_utils.build_component]).
+
+        When ``port`` is provided it is forwarded to
+        [`ClientServerExecutionStrategy`][agentlightning.ClientServerExecutionStrategy]
+        instances constructed (or supplied) for the trainer.
         """
         # Do not call super().__init__() here.
         # super().__init__() will call TrainerLegacy's initialization, which is not intended.
         self.worker_id: Optional[int] = None
 
+        if dev:
+            warnings.warn(
+                "Trainer(dev=True) is deprecated and will be removed in future versions. "
+                "Please use Trainer.dev(...) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._dev = dev
         self.daemon = daemon
         self._client: AgentLightningClient | None = None  # Will be initialized in fit or fit_v0
@@ -205,11 +220,18 @@ class Trainer(TrainerLegacy):
         # We might be able to support a list of resources in future.
         self.initial_resources = initial_resources
 
+        self.port = port
+
+        self.strategy = self._make_strategy(
+            strategy,
+            n_runners=self.n_runners,
+            port=port,
+        )
+
         # The active store for the current execution context
-        self.store = self._make_store(store)
+        self.store = self._make_store(store, self.strategy)
         self.runner = self._make_runner(runner)
 
-        self.strategy = self._make_strategy(strategy, n_runners=self.n_runners)
         if hasattr(self.strategy, "n_runners"):
             strategy_runners = getattr(self.strategy, "n_runners")
             if isinstance(strategy_runners, int) and strategy_runners > 0:
@@ -268,13 +290,19 @@ class Trainer(TrainerLegacy):
             type_error_fmt="Adapter factory returned {type_name}, which is not a TraceAdapter subclass.",
         )
 
-    def _make_store(self, store: ComponentSpec[LightningStore]) -> LightningStore:
-        """Resolve the store implementation backing rollouts, attempts, spans, and resources."""
+    def _make_store(self, store: ComponentSpec[LightningStore], strategy: ExecutionStrategy) -> LightningStore:
+        """Resolve the store implementation backing rollouts, attempts, spans, and resources.
+
+        By default, it's always a in-memory store. If using a client/server execution strategy,
+        the in-memory store will be initialized in a thread-safe manner.
+        """
+        is_client_server = isinstance(strategy, ClientServerExecutionStrategy)
+        default_store_factory = lambda: InMemoryLightningStore(thread_safe=is_client_server)
         return build_component(
             store,
             expected_type=LightningStore,
             spec_name="store",
-            default_factory=InMemoryLightningStore,
+            default_factory=default_store_factory,
             invalid_spec_error_fmt="Invalid store type: {actual_type}. Expected LightningStore, str, dict, or None.",
             type_error_fmt="Store factory returned {type_name}, which is not a LightningStore subclass.",
         )
@@ -284,13 +312,20 @@ class Trainer(TrainerLegacy):
         strategy: ComponentSpec[ExecutionStrategy],
         *,
         n_runners: int,
+        port: Optional[int] = None,
     ) -> ExecutionStrategy:
         """Resolve the execution strategy and seed defaults such as `n_runners`."""
         if isinstance(strategy, ExecutionStrategy):
+            if port is not None and isinstance(strategy, ClientServerExecutionStrategy):
+                strategy.server_port = port
             return strategy
         optional_defaults: Dict[str, Callable[[], Any]] = {"n_runners": lambda: n_runners}
+        if port is not None:
+            optional_defaults["server_port"] = lambda: port
 
         def default_factory() -> ExecutionStrategy:
+            if port is not None:
+                return ClientServerExecutionStrategy(n_runners=n_runners, server_port=port)
             return ClientServerExecutionStrategy(n_runners=n_runners)
 
         return build_component(

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
+
 """Data models that mirror OpenTelemetry spans for Agent Lightning."""
 
 import json
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Union
 
 from opentelemetry import trace as trace_api
 from opentelemetry.sdk.resources import Resource
@@ -14,7 +16,9 @@ from opentelemetry.sdk.trace import Event as OtelEvent
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
 from opentelemetry.trace.status import Status as OtelStatus
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+
+from agentlightning.semconv import AGL_VIRTUAL
 
 __all__ = [
     "AttributeValue",
@@ -29,6 +33,9 @@ __all__ = [
     "SpanNames",
     "SpanAttributeNames",
     "SpanLike",
+    "StatusCode",
+    "SpanCoreFields",
+    "SpanRecordingContext",
 ]
 
 
@@ -81,6 +88,8 @@ Attributes = Dict[str, AttributeValue]
 """Mapping from attribute names to their values. Same as OpenTelemetry `Attributes` type."""
 TraceState = Dict[str, str]
 """Mapping from trace state key to its value. Same as OpenTelemetry `TraceState` type."""
+StatusCode = Literal["UNSET", "OK", "ERROR"]
+"""The status code of the span."""
 
 
 class SpanContext(BaseModel):
@@ -95,8 +104,7 @@ class SpanContext(BaseModel):
     trace_state: TraceState
     """Mapping from trace state key to its value."""
 
-    class Config:
-        allow_extra = True
+    model_config = ConfigDict(extra="allow")
 
     @classmethod
     def from_opentelemetry(cls, src: trace_api.SpanContext) -> "SpanContext":
@@ -114,13 +122,12 @@ class SpanContext(BaseModel):
 class TraceStatus(BaseModel):
     """Serializable variant of `opentelemetry.trace.Status`."""
 
-    status_code: str
+    status_code: StatusCode
     """The status code of the span. Same as OpenTelemetry `Status.status_code` type."""
     description: Optional[str] = None
     """The description of the span. Same as OpenTelemetry `Status.description` type."""
 
-    class Config:
-        allow_extra = True
+    model_config = ConfigDict(extra="allow")
 
     @classmethod
     def from_opentelemetry(cls, src: OtelStatus) -> "TraceStatus":
@@ -143,8 +150,7 @@ class Event(BaseModel):
     timestamp: Optional[float] = None
     """The timestamp of the event. Same as OpenTelemetry `Event.timestamp` type."""
 
-    class Config:
-        allow_extra = True
+    model_config = ConfigDict(extra="allow")
 
     @classmethod
     def from_opentelemetry(cls, src: OtelEvent) -> "Event":
@@ -166,8 +172,7 @@ class Link(BaseModel):
     attributes: Optional[Attributes] = None
     """Optional attributes."""
 
-    class Config:
-        allow_extra = True
+    model_config = ConfigDict(extra="allow")
 
     @classmethod
     def from_opentelemetry(cls, src: trace_api.Link) -> "Link":
@@ -205,6 +210,44 @@ class OtelResource(BaseModel):
         )
 
 
+class SpanCoreFields(BaseModel):
+    """Core fields of a span. Used by span creators who don't care about the full span model.
+
+    If the spans are managed by some OTel tracer provider, it's not advised to create spans via this path.
+    """
+
+    name: str
+    """The name of the span."""
+    status: TraceStatus
+    """The status of the span."""
+    attributes: Attributes
+    """The attributes of the span."""
+    start_time: Optional[float]
+    """The start time of the span."""
+    end_time: Optional[float]
+    """The end time of the span."""
+
+
+class SpanRecordingContext(Protocol):
+    """Context for recording operations on a span. It doesn't have to finalize the span; the caller will do it."""
+
+    def record_exception(self, exception: BaseException) -> None:
+        """Record an exception on the span."""
+        raise NotImplementedError()
+
+    def record_attributes(self, attributes: Attributes) -> None:
+        """Record attributes on the span."""
+        raise NotImplementedError()
+
+    def record_status(self, status_code: StatusCode, description: Optional[str] = None) -> None:
+        """Record the status of the span."""
+        raise NotImplementedError()
+
+    def get_recorded_span(self) -> SpanCoreFields:
+        """Get the recording of the span."""
+        raise NotImplementedError()
+
+
 class Span(BaseModel):
     """Agent Lightning's canonical span model used for persistence and analytics.
 
@@ -214,8 +257,7 @@ class Span(BaseModel):
     stable even as upstream OpenTelemetry types evolve.
     """
 
-    class Config:
-        allow_extra = True  # allow extra fields if needed
+    model_config = ConfigDict(extra="allow")
 
     rollout_id: str
     """The rollout which this span belongs to."""
@@ -343,6 +385,7 @@ class Span(BaseModel):
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
         resource: Optional[OtelResource] = None,
+        status: Optional[TraceStatus] = None,
     ) -> "Span":
         """Build a synthetic span from raw attributes.
         Different from the [`from_opentelemetry`][agentlightning.Span.from_opentelemetry] method,
@@ -360,6 +403,7 @@ class Span(BaseModel):
             start_time: Span start timestamp in seconds.
             end_time: Span end timestamp in seconds.
             resource: Explicit resource information to attach to the span.
+            status: Optional status of the span.
 
         Returns:
             [`Span`][agentlightning.Span] populated with the provided attributes.
@@ -384,10 +428,10 @@ class Span(BaseModel):
                 is_remote=False,
                 trace_state={},
             ),
-            name=name or SpanNames.VIRTUAL.value,
+            name=name or AGL_VIRTUAL,
             resource=resource or OtelResource(attributes={}, schema_url=""),
             attributes=attributes,
-            status=TraceStatus(status_code="OK"),
+            status=status or TraceStatus(status_code="OK"),
             events=[],
             links=[],
             parent=(
@@ -402,9 +446,40 @@ class Span(BaseModel):
             ),
         )
 
+    @classmethod
+    def from_core_fields(
+        cls,
+        core: SpanCoreFields,
+        *,
+        rollout_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        sequence_id: Optional[int] = None,
+    ) -> Span:
+        """Build a span from a core span.
+
+        Args:
+            core: Core span to build from.
+            rollout_id: Optional rollout identifier associated with the span.
+            attempt_id: Optional attempt identifier associated with the span.
+            sequence_id: Optional sequence number to preserve ordering.
+
+        Returns:
+            [`Span`][agentlightning.Span] populated with the provided attributes.
+        """
+        return cls.from_attributes(
+            attributes=core.attributes,
+            rollout_id=rollout_id,
+            attempt_id=attempt_id,
+            sequence_id=sequence_id,
+            name=core.name,
+            start_time=core.start_time or time.time(),
+            end_time=core.end_time,
+            status=core.status,
+        )
+
 
 class SpanNames(str, Enum):
-    """Enumerated span names recognised by Agent-lightning."""
+    """Enumerated span names recognised by Agent-lightning. Deprecated in favor of [semconv][agentlightning.semconv]."""
 
     REWARD = "agentlightning.reward"
     """The name of the reward span."""
@@ -416,10 +491,16 @@ class SpanNames(str, Enum):
     """The name of the exception span."""
     VIRTUAL = "agentlightning.virtual"
     """The name of the virtual span. It represents derived spans without concrete operations."""
+    ROLLOUT_ID = "agentlightning.rollout_id"
+    """The name of the rollout ID."""
+    ATTEMPT_ID = "agentlightning.attempt_id"
+    """The name of the attempt ID."""
+    SPAN_SEQUENCE_ID = "agentlightning.span_sequence_id"
+    """The name of the span sequence ID."""
 
 
 class SpanAttributeNames(str, Enum):
-    """Canonical attribute names written by Agent Lightning emitters."""
+    """Canonical attribute names written by Agent Lightning emitters. Deprecated in favor of [semconv][agentlightning.semconv]."""
 
     MESSAGE = "message"
     """The name of the message attribute."""

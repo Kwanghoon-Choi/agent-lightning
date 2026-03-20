@@ -3,16 +3,63 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 from opentelemetry.sdk.trace import ReadableSpan
 from pydantic import BaseModel
 
-from agentlightning.types import Span, SpanNames, Triplet
+from agentlightning.emitter.reward import get_reward_value
+from agentlightning.semconv import AGL_OPERATION, AGL_REWARD, LightningSpanAttributes
+from agentlightning.types import Span, Triplet
+from agentlightning.utils.otel import filter_and_unflatten_attributes
 
 from .base import TraceAdapter
+
+logger = logging.getLogger(__name__)
+
+
+def _attributes_get_multiple(attributes: Dict[str, Any], keys: List[str]) -> Optional[str]:
+    """Get a string from the attributes, if present.
+    If there are multiple matches, the first one is returned.
+    """
+    for key in keys:
+        if key in attributes:
+            if isinstance(attributes[key], str):
+                return attributes[key]
+            else:
+                logger.warning(f"Attribute {key} is found but is not a string: {attributes[key]}")
+    return None
+
+
+def _attributes_get_ids_multiple(attributes: Dict[str, Any], keys: List[str]) -> Optional[List[int]]:
+    """Get a list of integers from the attributes, if present.
+    If there are multiple matches, the first one is returned.
+    """
+    for key in keys:
+        if key in attributes:
+            if (isinstance(attributes[key], list) or isinstance(attributes[key], tuple)) and all(
+                isinstance(x, int) for x in attributes[key]
+            ):
+                return list(attributes[key])
+            else:
+                logger.warning(f"Attribute {key} is found but is not a list of integers: {attributes[key]}")
+    return None
+
+
+def _attributes_unflatten_multiple(
+    attributes: Dict[str, Any], keys: List[str]
+) -> Union[Dict[str, Any], List[Any], None]:
+    """Unflatten the attributes, if present.
+    If there are multiple matches, the first one is returned.
+    """
+    for key in keys:
+        result = filter_and_unflatten_attributes(attributes, key)
+        if result:
+            return result
+    return None
 
 
 class Transition(BaseModel):
@@ -127,7 +174,7 @@ class TraceTree:
             if not should_visit(node):
                 return False
             agent_name = node.agent_name()
-            vis_name = node.id[:8] + " (" + node.span.name + ")"
+            vis_name = node.id[-8:] + " (" + node.span.name + ")"
             if agent_name is not None:
                 vis_name += " [" + agent_name + "]"
             dot.node(node.id, vis_name)  # type: ignore
@@ -304,30 +351,30 @@ class TraceTree:
         if agent_name is not None:
             return agent_name
 
+        # Case 6: Weave
+        is_agent_type = attributes.get("type") == "agent"
+        if is_agent_type:
+            agent_name = cast(Optional[str], attributes.get("agentlightning.operation.input.name"))
+            if agent_name is not None:
+                return agent_name
+
+        # Case 7: Weave + LangChain
+        if self.span.name.startswith("langchain.Chain."):
+            attributes_lc_name = cast(Optional[str], attributes.get("lc_name"))
+            if attributes_lc_name is not None:
+                return attributes_lc_name
+
     def maybe_reward_dict(self) -> dict[str, Any]:
         """Return a reward payload if the span encodes one.
 
         Returns:
             Dictionary containing reward metadata, or an empty dictionary when no reward is found.
         """
-        for key in [
-            "agentops.task.output",  # newer versions of agentops
-            "agentops.entity.output",
-        ]:
-            output = self.span.attributes.get(key)  # type: ignore
-            if output:
-                if isinstance(output, dict):
-                    return output
-                elif isinstance(output, str):
-                    try:
-                        return json.loads(output)
-                    except json.JSONDecodeError:
-                        return {}
-
-        # Latest emit reward format
-        if self.span.name == SpanNames.REWARD.value and self.span.attributes:
-            return {"type": "reward", "value": self.span.attributes.get("reward", None)}
-        return {}
+        reward_value = get_reward_value(self.span)
+        if reward_value is not None:
+            return {"type": "reward", "value": reward_value}
+        else:
+            return {}
 
     def is_reward_span(self) -> bool:
         """Return whether the span explicitly encodes a reward.
@@ -336,7 +383,17 @@ class TraceTree:
             `True` when the span payload describes a reward, otherwise `False`.
         """
         maybe_reward = self.maybe_reward_dict()
-        return maybe_reward and maybe_reward.get("type") == "reward"  # type: ignore
+        if maybe_reward and maybe_reward.get("type") == "reward":  # type: ignore
+            return True
+
+        # Agent-lightning 0.3+
+        if (
+            self.span.name == AGL_OPERATION
+            and self.span.attributes.get(LightningSpanAttributes.OPERATION_NAME.value) == AGL_REWARD
+        ):
+            return True
+
+        return False
 
     def find_llm_calls(
         self,
@@ -373,7 +430,9 @@ class TraceTree:
             is_llm_call = False
         if is_llm_call:
             # Check the response id
-            response_id: Optional[str] = self.span.attributes.get("gen_ai.response.id")  # type: ignore
+            response_id = _attributes_get_multiple(
+                self.span.attributes, ["gen_ai.response.id", "agentlightning.operation.output.id"]
+            )
             if response_id is None and within_llm_call is True:
                 is_llm_call = False
             if (
@@ -385,7 +444,8 @@ class TraceTree:
 
             if is_llm_call:
                 llm_calls.append((self, within_matching_subtree))  # type: ignore
-                existing_llm_call_response_ids = existing_llm_call_response_ids or set()
+                if existing_llm_call_response_ids is None:
+                    existing_llm_call_response_ids = set()
                 if response_id is not None:
                     existing_llm_call_response_ids.add(response_id)
                 if within_llm_call is not None:
@@ -426,7 +486,16 @@ class TraceTree:
         If we don't, when we want to select the LLM completion span with agent as filter.
         We will never get the correct span underneath.
         """
+        # If the current node has only one child, recursively repair its hierarchy directly.
+        # This special-case handling is needed because when a trace is manually ended
+        # (via agentops.end_trace), the AgentOps provider automatically wraps all spans
+        # under an extra synthetic root node (e.g., "run_one.session").
+        if len(self.children) == 1:
+            self.children[0].repair_hierarchy()
+            return
+
         nodes_to_repair = list(self.children)
+
         for repair_node in nodes_to_repair:
             if len(self.children) == 1:
                 # If there is only one child, we don't need to repair the hierarchy.
@@ -490,12 +559,12 @@ class TraceTree:
                 assign_to: List[Tuple[str, int]] = []
                 for child in item.children:
                     if child.id in llm_call_ids:
-                        assign_to.append(child.id)  # type: ignore
+                        assign_to.append((child.id, child.end_time))  # type: ignore
 
-                    agentops_output = item.maybe_reward_dict()
+                    agentops_output = child.maybe_reward_dict()
                     if agentops_output and agentops_output.get("type") == "reward":
                         for assign_to_id, assign_to_end_time in reversed(assign_to):
-                            if assign_to_end_time > item.start_time:  # type: ignore
+                            if assign_to_end_time > child.start_time:  # type: ignore
                                 # This reward happens before the end of the LLM call.
                                 continue
                             if assign_to_id in rewards:
@@ -505,6 +574,131 @@ class TraceTree:
 
         return rewards
 
+    def extract_prompt_image_urls(self, prompt_raw_content: Any) -> List[str]:
+        """Extract image URLs from the span attributes, in order of appearance.
+
+        Args:
+            prompt_raw_content: The raw content of the prompt, which can be in one of several formats:
+
+                - List[dict]: A list of message entries, each being a dict with at least a "content" key.
+                - Dict[str, Any]: A dictionary, often with numeric string keys (e.g., `{"0": {...}, "1": {...}}`), where each value is a message entry.
+                  If the dict does not have numeric keys, it is treated as a single message entry.
+        """
+        message_entries: List[Any] = []
+        if isinstance(prompt_raw_content, list):
+            message_entries = cast(List[Any], prompt_raw_content)
+        elif isinstance(prompt_raw_content, dict):
+            # Common when the attributes expand to {"0": {...}, "prompt_filter_results": ...}
+            numeric_keys = [
+                key
+                for key in cast(Dict[str, Any], prompt_raw_content).keys()
+                if isinstance(key, str) and key.isdigit()  # pyright: ignore[reportUnnecessaryIsInstance]
+            ]
+            if numeric_keys:
+                for key in sorted(numeric_keys, key=int):
+                    message_entries.append(prompt_raw_content[key])
+            else:
+                message_entries = [prompt_raw_content]
+        else:
+            return []
+
+        image_urls: List[str] = []
+        for message in cast(List[Dict[str, Any]], message_entries):
+            if (
+                not isinstance(message, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
+                or "content" not in message
+            ):
+                continue
+            content = message["content"]
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)  # This content should now be a list
+                except json.JSONDecodeError:
+                    logger.debug(f"Failed to parse message content as JSON: {content}")
+                    continue
+            if isinstance(content, list):
+                for content_part in cast(List[Dict[str, Any]], content):
+                    if not isinstance(content_part, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+                        continue
+                    if content_part.get("type") == "image_url":
+                        image_url_dict = cast(Dict[str, Any], content_part.get("image_url"))
+                        if not isinstance(image_url_dict, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+                            continue
+                        if "url" in image_url_dict:
+                            image_urls.append(image_url_dict["url"])
+        return image_urls
+
+    def span_to_triplet(self, span: Span, agent_name: str) -> Triplet:
+        """Convert a span to a triplet.
+
+        Subclass can override this method to add more fields to the triplet,
+        such as chat messages and tool calls.
+        """
+        prompt_token_ids = (
+            _attributes_get_ids_multiple(
+                span.attributes,
+                [
+                    "prompt_token_ids",
+                    "agentlightning.operation.output.prompt_token_ids",  # Weave tracer
+                ],
+            )
+            or []
+        )
+        response_token_ids = (
+            _attributes_get_ids_multiple(
+                span.attributes,
+                [
+                    "response_token_ids",
+                    "agentlightning.operation.output.response_token_ids.0",  # Weave tracer
+                    "agentlightning.operation.output.choices.0.token_ids",  # Weave tracer with newer vLLM
+                    "agentlightning.operation.output.choices.0.provider_specific_fields.token_ids",  # new vLLM + new OpenAI client SDK
+                ],
+            )
+            or []
+        )
+
+        response_id = _attributes_get_multiple(
+            span.attributes, ["gen_ai.response.id", "agentlightning.operation.output.id"]
+        )
+        request_metadata = _attributes_unflatten_multiple(
+            span.attributes, ["gen_ai.request", "agentlightning.operation.input"]
+        )
+        response_metadata = _attributes_unflatten_multiple(
+            span.attributes, ["gen_ai.response", "agentlightning.operation.output"]
+        )
+        # Special handling for Weave tracer: messages are handled separately
+        if isinstance(request_metadata, dict):
+            request_metadata.pop("messages", None)
+        if isinstance(response_metadata, dict):
+            response_metadata.pop("choices", None)
+            response_metadata.pop("prompt_token_ids", None)
+            response_metadata.pop("response_token_ids", None)
+
+        prompt_raw_content = _attributes_unflatten_multiple(
+            span.attributes, ["gen_ai.prompt", "agentlightning.operation.input.messages"]
+        )
+        completion_raw_content = _attributes_unflatten_multiple(
+            span.attributes, ["gen_ai.completion", "agentlightning.operation.output.choices"]
+        )
+        image_urls = self.extract_prompt_image_urls(prompt_raw_content)
+        prompt_payload = {"token_ids": prompt_token_ids, "raw_content": prompt_raw_content, "image_urls": image_urls}
+        response_payload = {"token_ids": response_token_ids, "raw_content": completion_raw_content}
+
+        # FIXME: logprob doesn't support Weave tracer yet.
+        logprobs_content = span.attributes.get("logprobs.content", None)  # type: ignore
+        if isinstance(logprobs_content, str):
+            logprobs_content = json.loads(logprobs_content)
+            response_payload["logprobs"] = logprobs_content
+
+        return Triplet(
+            prompt=prompt_payload,
+            response=response_payload,
+            reward=None,
+            metadata=dict(
+                request=request_metadata, response=response_metadata, response_id=response_id, agent_name=agent_name
+            ),
+        )
+
     def to_trajectory(
         self,
         llm_call_match: str = r"openai\.chat\.completion",
@@ -513,6 +707,7 @@ class TraceTree:
         dedup_llm_call: bool = True,
         reward_match: RewardMatchPolicy = RewardMatchPolicy.FIRST_OCCURRENCE,
         final_reward: Optional[float] = None,
+        _skip_empty_token_spans: bool = False,
     ) -> List[Triplet]:
         """Convert the trace tree into a trajectory of [`Triplet`][agentlightning.Triplet] items.
 
@@ -537,25 +732,23 @@ class TraceTree:
             within_llm_call=False if dedup_llm_call else None,
             existing_llm_call_response_ids=set(),
         )
-        id_transitions = [
-            (
-                llm_call.id,
-                Triplet(
-                    prompt={"token_ids": llm_call.span.attributes.get("prompt_token_ids", [])},  # type: ignore
-                    response={"token_ids": llm_call.span.attributes.get("response_token_ids", [])},  # type: ignore
-                    reward=None,
-                    metadata=dict(
-                        response_id=llm_call.span.attributes.get(  # type: ignore
-                            "gen_ai.response.id", None
-                        ),  # it works at least for OpenAI
-                        agent_name=agent_name,
-                    ),
-                ),
-            )
-            for llm_call, agent_name in llm_calls
-        ]
 
-        rewards = self.match_rewards(reward_match, [call for call, _ in llm_calls])
+        id_transitions: List[Tuple[str, Triplet]] = []
+        # We need to filter out the LLM calls with unrecorded token IDs
+        filtered_llm_calls: List[Tuple[TraceTree, str]] = []
+        for llm_call, agent_name in llm_calls:
+            triplet = self.span_to_triplet(llm_call.span, agent_name)
+            # This is a hot-fix for Tinker+CrewAI, which has some anonymous requests outside the trained agent.
+            # TODO: We might need to reconsider this.
+            if _skip_empty_token_spans and (
+                not triplet.prompt.get("token_ids") or not triplet.response.get("token_ids")
+            ):
+                logger.warning(f"Skipping LLM call with unrecorded token IDs: {triplet}")
+                continue
+            filtered_llm_calls.append((llm_call, agent_name))
+            id_transitions.append((llm_call.id, triplet))
+
+        rewards = self.match_rewards(reward_match, [call for call, _ in filtered_llm_calls])
         transitions = [
             transition.model_copy(update={"reward": rewards.get(id, None)}) for id, transition in id_transitions
         ]
@@ -597,12 +790,14 @@ class TracerTraceToTriplet(TraceToTripletBase):
         agent_match: Optional[str] = None,
         exclude_llm_call_in_reward: bool = True,
         reward_match: RewardMatchPolicy = RewardMatchPolicy.FIRST_OCCURRENCE,
+        _skip_empty_token_spans: bool = False,
     ):
         self.repair_hierarchy = repair_hierarchy
         self.llm_call_match = llm_call_match
         self.agent_match = agent_match
         self.exclude_llm_call_in_reward = exclude_llm_call_in_reward
         self.reward_match = reward_match
+        self._skip_empty_token_spans = _skip_empty_token_spans
 
     def visualize(
         self,
@@ -633,7 +828,7 @@ class TracerTraceToTriplet(TraceToTripletBase):
         trace_tree.visualize(filename, interested_span_match=interested_span_match)
         return trace_tree
 
-    def adapt(self, source: Union[List[Span], List[ReadableSpan]], /) -> List[Triplet]:  # type: ignore
+    def adapt(self, source: Union[Sequence[Span], Sequence[ReadableSpan]], /) -> List[Triplet]:  # type: ignore
         """Convert tracer spans into [`Triplet`][agentlightning.Triplet] trajectories.
 
         Args:
@@ -654,6 +849,7 @@ class TracerTraceToTriplet(TraceToTripletBase):
             agent_match=self.agent_match,
             exclude_llm_call_in_reward=self.exclude_llm_call_in_reward,
             reward_match=self.reward_match,
+            _skip_empty_token_spans=self._skip_empty_token_spans,
         )
         return trajectory
 
@@ -738,31 +934,14 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
 
     def _maybe_reward_value(self, span: Span) -> Optional[float]:
         """Parse reward from typical AgentOps payloads or explicit reward spans."""
-        attrs = span.attributes or {}
-
-        # AgentOps new/old keys
-        for k in ("agentops.task.output", "agentops.entity.output"):
-            v = attrs.get(k)
-            v = self._literal_eval_maybe(v)
-            if isinstance(v, dict) and cast(Dict[str, Any], v).get("type") == "reward":
-                rv = cast(Dict[str, Any], v).get("value", None)
-                if rv is None or isinstance(rv, (int, float)):
-                    return None if rv is None else float(rv)
-
-        # Explicit reward span
-        if span.name == SpanNames.REWARD.value:
-            rv = attrs.get("reward", None)
-            if rv is None or isinstance(rv, (int, float)):
-                return None if rv is None else float(rv)
-
-        return None
+        return get_reward_value(span)
 
     def _request_id_from_attrs(self, attrs: Dict[str, Any]) -> Optional[str]:
         # Prefer OpenAI-like id if present, else proxy raw id.
         rid = attrs.get("gen_ai.response.id") or attrs.get("llm.hosted_vllm.id")
         return str(rid) if isinstance(rid, str) and rid else None
 
-    def adapt(self, source: List[Span], /) -> List[Triplet]:  # type: ignore
+    def adapt(self, source: Sequence[Span], /) -> List[Triplet]:  # type: ignore
         """Convert LLM Proxy spans into [`Triplet`][agentlightning.Triplet] trajectories.
 
         Args:

@@ -49,6 +49,10 @@ markdown_extensions:
   - toc:
       permalink: true
   - attr_list
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
 plugins:
   - search
@@ -98,12 +102,14 @@ nav:
     - Train the First Agent: how-to/train-first-agent.md
     - Write the First Algorithm: how-to/write-first-algorithm.md
   - How-To Recipes:
+    - Examples Catalog: how-to/examples-catalog.md
     - SFT with Unsloth: how-to/unsloth-sft.md
     - Train SQL Agent with RL: how-to/train-sql-agent.md
   - Learning More:
     - Write Agents: tutorials/write-agents.md
     - Debugging: tutorials/debug.md
-    - Working with Traces: tutorials/traces.md
+    - Work with Traces: tutorials/traces.md
+    - Use Emitters: tutorials/emitter.md
     - Parallelize: tutorials/parallelize.md
   - Algorithm Zoo:
     - Overview: algorithm-zoo/index.md
@@ -119,10 +125,17 @@ nav:
     - Command Line: reference/cli.md
     - Instrumentation: reference/instrumentation.md
     - Runner: reference/runner.md
+    - Semantic Conventions: reference/semconv.md
     - Store: reference/store.md
     - Trainer: reference/trainer.md
     - Types: reference/types.md
+    - RESTful: reference/restful.md
+    - Utilities: reference/utilities.md
     - Internal: reference/internal.md
+  - Miscellaneous:
+    - Contributing Guide: community/contributing.md
+    - Maintainer Guide: community/maintainers.md
+    - Changelog: changelog.md
 
 extra_css:
   - https://unpkg.com/katex@0/dist/katex.min.css

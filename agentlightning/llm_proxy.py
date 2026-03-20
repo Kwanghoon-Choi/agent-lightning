@@ -4,27 +4,57 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import logging
 import os
 import re
-import socket
 import tempfile
 import threading
 import time
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, TypedDict, Union, cast
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypedDict,
+    Union,
+    cast,
+)
 
 import litellm
 import opentelemetry.trace as trace_api
-import uvicorn
 import yaml
 from fastapi import Request, Response
+from fastapi.responses import StreamingResponse
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.opentelemetry import OpenTelemetry, OpenTelemetryConfig
 from litellm.proxy.proxy_server import app, save_worker_config  # pyright: ignore[reportUnknownVariableType]
+from litellm.types.utils import CallTypes
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import Scope
 
+from agentlightning.semconv import LightningResourceAttributes
 from agentlightning.types import LLM, ProxyLLM
+from agentlightning.utils.server_launcher import (
+    LaunchMode,
+    PythonServerLauncher,
+    PythonServerLauncherArgs,
+    noop_context,
+)
 
 from .store.base import LightningStore
 
@@ -77,88 +107,43 @@ def _get_pre_call_data(args: Any, kwargs: Any) -> Dict[str, Any]:
     return cast(Dict[str, Any], data)
 
 
-# We need global state because litellm is based on a global app.
-# Repeatedly initializing the app with different stores will cause errors.
-_initialized: bool = False
-_global_store: LightningStore | None = None
+def _reset_litellm_logging_worker() -> None:
+    """Reset LiteLLM's global logging worker to the current event loop.
 
-
-def get_global_store() -> LightningStore:
-    """Return the globally registered LightningStore.
-
-    Used by components that are initialized without an explicit store
-    (e.g., exporter created inside OpenTelemetry).
-
-    Returns:
-        LightningStore: The active global store.
-
-    Raises:
-        ValueError: If the global store has not been set by `LLMProxy.start()`.
+    LiteLLM keeps a module-level ``GLOBAL_LOGGING_WORKER`` singleton that owns an
+    ``asyncio.Queue``. The queue is bound to the event loop where it was created.
+    When the proxy is restarted, Uvicorn spins up a brand new event loop in a new
+    thread. If the existing logging worker (and its queue) are reused, LiteLLM
+    raises ``RuntimeError: <Queue ...> is bound to a different event loop`` the
+    next time it tries to log. Recreating the worker ensures that LiteLLM will
+    lazily initialise a fresh queue on the new loop.
     """
-    if _global_store is None:
-        raise ValueError("Global store is not initialized. Please start a LLMProxy first.")
-    return _global_store
+
+    # ``GLOBAL_LOGGING_WORKER`` is imported in a few LiteLLM modules at runtime.
+    # Update any already-imported references so future calls use the fresh worker.
+    try:
+        import litellm.utils as litellm_utils
+        from litellm.litellm_core_utils import logging_worker as litellm_logging_worker
+
+        litellm_logging_worker.GLOBAL_LOGGING_WORKER = litellm_logging_worker.LoggingWorker()
+        litellm_utils.GLOBAL_LOGGING_WORKER = litellm_logging_worker.GLOBAL_LOGGING_WORKER  # type: ignore[reportAttributeAccessIssue]
+    except Exception:  # pragma: no cover - best-effort hygiene
+        logger.warning("Unable to propagate LiteLLM logging worker reset.", exc_info=True)
 
 
-def initialize() -> None:
-    """Initialize global middleware and LiteLLM callbacks once.
+def _reset_litellm_logging_callback_manager() -> None:
+    """Reset LiteLLM's global callback manager.
 
-    Idempotent. Installs:
+    To get rid of the warning message: "Cannot add callback - would exceed MAX_CALLBACKS limit of 30."
+    when litellm is restarted multiple times in the same process.
 
-    * A FastAPI middleware that rewrites /rollout/{rid}/attempt/{aid}/... paths,
-      injects rollout/attempt/sequence headers, and forwards downstream.
-    * LiteLLM callbacks for token ids and OpenTelemetry export.
-
-    This function does not start any server. It only wires global hooks.
+    It does not respect existing input/output callbacks.
     """
-    global _initialized
-    if _initialized:
-        return
 
-    # Add middleware here because it relies on the global store.
-    @app.middleware("http")
-    async def rollout_attempt_middleware(  # pyright: ignore[reportUnusedFunction]
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        # Decode rollout and attempt from the URL prefix. Example:
-        #   /rollout/r123/attempt/a456/v1/chat/completions
-        # becomes
-        #   /v1/chat/completions
-        # while adding request-scoped headers for trace attribution.
-        path = request.url.path
-
-        match = re.match(r"^/rollout/([^/]+)/attempt/([^/]+)(/.*)?$", path)
-        if match:
-            rollout_id = match.group(1)
-            attempt_id = match.group(2)
-            new_path = match.group(3) if match.group(3) is not None else "/"
-
-            # Rewrite the ASGI scope path so downstream sees a clean OpenAI path.
-            request.scope["path"] = new_path
-            request.scope["raw_path"] = new_path.encode()
-
-            # Allocate a monotonic sequence id per (rollout, attempt).
-            sequence_id = await get_global_store().get_next_span_sequence_id(rollout_id, attempt_id)
-
-            # Inject headers so downstream components and exporters can retrieve them.
-            request.scope["headers"] = list(request.scope["headers"]) + [
-                (b"x-rollout-id", rollout_id.encode()),
-                (b"x-attempt-id", attempt_id.encode()),
-                (b"x-sequence-id", str(sequence_id).encode()),
-            ]
-
-        response = await call_next(request)
-        return response
-
-    # Register callbacks once on the global LiteLLM callback list.
-    litellm.callbacks.extend(  # pyright: ignore[reportUnknownMemberType]
-        [
-            AddReturnTokenIds(),
-            LightningOpenTelemetry(),
-        ]
-    )
-
-    _initialized = True
+    try:
+        litellm.logging_callback_manager._reset_all_callbacks()  # pyright: ignore[reportPrivateUsage]
+    except Exception:  # pragma: no cover - best-effort hygiene
+        logger.warning("Unable to reset LiteLLM logging callback manager.", exc_info=True)
 
 
 class AddReturnTokenIds(CustomLogger):
@@ -167,8 +152,8 @@ class AddReturnTokenIds(CustomLogger):
     This mutates the outgoing request payload to include `return_token_ids=True`
     for backends that support token id return (e.g., vLLM).
 
-    See:
-        https://github.com/vllm-project/vllm/pull/22587
+    See also:
+        [vLLM PR #22587](https://github.com/vllm-project/vllm/pull/22587)
     """
 
     async def async_pre_call_hook(self, *args: Any, **kwargs: Any) -> Optional[Union[Exception, str, Dict[str, Any]]]:
@@ -190,6 +175,24 @@ class AddReturnTokenIds(CustomLogger):
         return {**data, "return_token_ids": True}
 
 
+class AddLogprobs(CustomLogger):
+    """LiteLLM logger hook to request logprobs from vLLM.
+
+    This mutates the outgoing request payload to include `logprobs=1`
+    for backends that support logprobs return (e.g., vLLM).
+    """
+
+    async def async_pre_call_hook(self, *args: Any, **kwargs: Any) -> Optional[Union[Exception, str, Dict[str, Any]]]:
+        """Async pre-call hook to adjust request payload."""
+        try:
+            data = _get_pre_call_data(args, kwargs)
+        except Exception as e:
+            return e
+
+        # Ensure logprobs are requested from the backend when supported.
+        return {**data, "logprobs": 1}
+
+
 class LightningSpanExporter(SpanExporter):
     """Buffered OTEL span exporter with subtree flushing and training-store sink.
 
@@ -205,15 +208,13 @@ class LightningSpanExporter(SpanExporter):
     * Buffer access is protected by a re-entrant lock.
     * Export is synchronous to the caller yet schedules an async flush on the
       internal loop, then waits for completion.
-
-    Args:
-        store: Optional explicit LightningStore. If None, uses `get_global_store()`.
     """
 
-    def __init__(self, store: Optional[LightningStore] = None):
-        self._store = store
+    def __init__(self, _store: Optional[LightningStore] = None):
+        self._store: Optional[LightningStore] = _store  # this is only for testing purposes
         self._buffer: List[ReadableSpan] = []
-        self._lock: Optional[threading.RLock] = None
+        self._lock: Optional[threading.Lock] = None
+        self._loop_lock_pid: Optional[int] = None
 
         # Single dedicated event loop running in a daemon thread.
         # This decouples OTEL SDK threads from our async store I/O.
@@ -221,40 +222,46 @@ class LightningSpanExporter(SpanExporter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
 
+        self._otlp_exporter = OTLPSpanExporter()
+
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         """Lazily initialize the event loop and thread on first use.
 
         Returns:
             asyncio.AbstractEventLoop: The initialized event loop.
         """
+        self._clear_loop_and_lock()
         if self._loop is None:
             self._loop = asyncio.new_event_loop()
             self._loop_thread = threading.Thread(target=self._run_loop, name="LightningSpanExporterLoop", daemon=True)
             self._loop_thread.start()
         return self._loop
 
-    def _ensure_lock(self) -> threading.RLock:
+    def _ensure_lock(self) -> threading.Lock:
         """Lazily initialize the lock on first use.
 
         Returns:
-            threading.RLock: The initialized lock.
+            threading.Lock: The initialized lock.
         """
+        self._clear_loop_and_lock()
         if self._lock is None:
-            self._lock = threading.RLock()
+            self._lock = threading.Lock()
         return self._lock
 
-    def _get_store(self) -> LightningStore:
-        """Return the LightningStore to use.
+    def _clear_loop_and_lock(self) -> None:
+        """Clear the loop and lock.
+        This happens if the exporter was used in a process then used in another process.
 
-        Returns:
-            LightningStore: Explicit store if provided, else the global store.
-
-        Raises:
-            ValueError: If no global store is configured and no explicit store was given.
+        This should only happen in CI.
         """
-        if self._store is None:
-            return get_global_store()
-        return self._store
+        if os.getpid() != self._loop_lock_pid:
+            logger.warning("Loop and lock are not owned by the current process. Clearing them.")
+            self._loop = None
+            self._loop_thread = None
+            self._lock = None
+            self._loop_lock_pid = os.getpid()
+        elif self._loop_lock_pid is None:
+            self._loop_lock_pid = os.getpid()
 
     def _run_loop(self) -> None:
         """Run the private asyncio loop forever on the exporter thread."""
@@ -300,24 +307,18 @@ class LightningSpanExporter(SpanExporter):
         with self._ensure_lock():
             for span in spans:
                 self._buffer.append(span)
-
-        # Run the async flush on our private loop, synchronously from caller's POV.
-        async def _locked_flush():
-            # Take the lock inside the coroutine to serialize with other flushes.
-            with self._ensure_lock():
-                return await self._maybe_flush()
-
-        try:
-            loop = self._ensure_loop()
-            fut = asyncio.run_coroutine_threadsafe(_locked_flush(), loop)
-            fut.result()  # Bubble up any exceptions from the coroutine.
-        except Exception as e:
-            logger.exception("Export flush failed: %s", e)
-            return SpanExportResult.FAILURE
+            default_endpoint = self._otlp_exporter._endpoint  # pyright: ignore[reportPrivateUsage]
+            try:
+                self._maybe_flush()
+            except Exception as e:
+                logger.exception("Export flush failed: %s", e)
+                return SpanExportResult.FAILURE
+            finally:
+                self._otlp_exporter._endpoint = default_endpoint  # pyright: ignore[reportPrivateUsage]
 
         return SpanExportResult.SUCCESS
 
-    async def _maybe_flush(self):
+    def _maybe_flush(self):
         """Flush ready subtrees from the buffer.
 
         Strategy:
@@ -339,6 +340,20 @@ class LightningSpanExporter(SpanExporter):
             if not subtree_spans:
                 continue
 
+            # Store is initialized lazily here in most cases.
+            store = self._store or get_active_llm_proxy().get_store()
+            if store is None:
+                logger.warning("Store is not set in LLMProxy. Cannot log spans to store.")
+                continue
+
+            # If the store supports OTLP endpoint, use it.
+            if store.capabilities.get("otlp_traces", False):
+                otlp_traces_endpoint = store.otlp_traces_endpoint()
+                self._otlp_exporter._endpoint = otlp_traces_endpoint  # pyright: ignore[reportPrivateUsage]
+                otlp_enabled = True
+            else:
+                otlp_enabled = False
+
             # Merge all custom headers found in the subtree.
             headers_merged: Dict[str, Any] = {}
 
@@ -352,6 +367,9 @@ class LightningSpanExporter(SpanExporter):
                     logger.error(
                         f"metadata.requester_custom_headers is not stored as a string: {headers_str}. Skipping the span."
                     )
+                    continue
+                if not headers_str.strip():
+                    logger.warning("metadata.requester_custom_headers is an empty string. Skipping the span.")
                     continue
                 try:
                     # Use literal_eval to parse the stringified dict safely.
@@ -369,7 +387,9 @@ class LightningSpanExporter(SpanExporter):
                 headers_merged.update(cast(Dict[str, Any], headers))
 
             if not headers_merged:
-                logger.warning(f"No headers found in {len(subtree_spans)} subtree spans. Cannot log to store.")
+                logger.warning(
+                    f"No headers found in {len(subtree_spans)} subtree spans of root {root_span_id}. Cannot log to store."
+                )
                 continue
 
             # Validate and normalize required header fields.
@@ -389,10 +409,34 @@ class LightningSpanExporter(SpanExporter):
             sequence_id_decimal = int(sequence_id)
 
             # Persist each span in the subtree with the resolved identifiers.
-            for span in subtree_spans:
-                await self._get_store().add_otel_span(
-                    rollout_id=rollout_id, attempt_id=attempt_id, sequence_id=sequence_id_decimal, readable_span=span
-                )
+            if otlp_enabled:
+                # If store has OTLP support, directly use OTLP exporter and export in batch
+                for span in subtree_spans:
+                    span._resource = span._resource.merge(  # pyright: ignore[reportPrivateUsage]
+                        Resource.create(
+                            {
+                                LightningResourceAttributes.ROLLOUT_ID.value: rollout_id,
+                                LightningResourceAttributes.ATTEMPT_ID.value: attempt_id,
+                                LightningResourceAttributes.SPAN_SEQUENCE_ID.value: sequence_id_decimal,
+                            }
+                        )
+                    )
+                export_result = self._otlp_exporter.export(subtree_spans)
+                if export_result != SpanExportResult.SUCCESS:
+                    raise RuntimeError(f"Failed to export spans via OTLP exporter. Result: {export_result}")
+
+            else:
+                # The old way: store does not support OTLP endpoint
+                for span in subtree_spans:
+                    loop = self._ensure_loop()
+                    add_otel_span_task = store.add_otel_span(
+                        rollout_id=rollout_id,
+                        attempt_id=attempt_id,
+                        sequence_id=sequence_id_decimal,
+                        readable_span=span,
+                    )
+                    fut = asyncio.run_coroutine_threadsafe(add_otel_span_task, loop)
+                    fut.result()  # Bubble up any exceptions from the coroutine.
 
     def _get_root_span_ids(self) -> Iterable[int]:
         """Yield span_ids for root spans currently in the buffer.
@@ -460,22 +504,504 @@ class LightningOpenTelemetry(OpenTelemetry):
     * Ensures each request is annotated with a per-attempt sequence id so spans
       are ordered deterministically even with clock skew across nodes.
     * Uses [`LightningSpanExporter`][agentlightning.llm_proxy.LightningSpanExporter] to persist spans for analytics and training.
-
-    Args:
-        store: Optional explicit LightningStore for the exporter.
     """
 
-    def __init__(self, store: LightningStore | None = None):
-        config = OpenTelemetryConfig(exporter=LightningSpanExporter(store))
+    def __init__(self):
+        config = OpenTelemetryConfig(exporter=LightningSpanExporter())
 
         # Check for tracer initialization
-        if (
-            hasattr(trace_api, "_TRACER_PROVIDER")
-            and trace_api._TRACER_PROVIDER is not None  # pyright: ignore[reportPrivateUsage]
-        ):
+        if _check_tracer_provider():
             logger.error("Tracer is already initialized. OpenTelemetry may not work as expected.")
 
         super().__init__(config=config)  # pyright: ignore[reportUnknownMemberType]
+
+    async def async_pre_call_deployment_hook(
+        self, kwargs: Dict[str, Any], call_type: Optional[CallTypes] = None
+    ) -> Optional[Dict[str, Any]]:
+        """The root span is sometimes missing (e.g., when Anthropic endpoint is used).
+        It is created in an auth module in LiteLLM. If it's missing, we create it here.
+        """
+        if "metadata" not in kwargs or "litellm_parent_otel_span" not in kwargs["metadata"]:
+            parent_otel_span = self.create_litellm_proxy_request_started_span(  # type: ignore
+                start_time=datetime.now(),
+                headers=kwargs.get("headers", {}),
+            )
+            updated_metadata = {**kwargs.get("metadata", {}), "litellm_parent_otel_span": parent_otel_span}
+
+            return {**kwargs, "metadata": updated_metadata}
+        else:
+            return kwargs
+
+
+class RolloutAttemptMiddleware(BaseHTTPMiddleware):
+    """
+    Rewrites /rollout/{rid}/attempt/{aid}/... -> /...
+    and injects x-rollout-id, x-attempt-id, x-sequence-id headers.
+
+    LLMProxy can update store later without rebuilding middleware.
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        # Decode rollout and attempt from the URL prefix. Example:
+        #   /rollout/r123/attempt/a456/v1/chat/completions
+        # becomes
+        #   /v1/chat/completions
+        # while adding request-scoped headers for trace attribution.
+        path = request.url.path
+
+        match = re.match(r"^/rollout/([^/]+)/attempt/([^/]+)(/.*)?$", path)
+        if match:
+            rollout_id = match.group(1)
+            attempt_id = match.group(2)
+            new_path = match.group(3) if match.group(3) is not None else "/"
+
+            # Rewrite the ASGI scope path so downstream sees a clean OpenAI path.
+            request.scope["path"] = new_path
+            request.scope["raw_path"] = new_path.encode()
+
+            store = get_active_llm_proxy().get_store()
+            if store is not None:
+                # Allocate a monotonic sequence id per (rollout, attempt).
+                sequence_id = await store.get_next_span_sequence_id(rollout_id, attempt_id)
+
+                # Inject headers so downstream components and exporters can retrieve them.
+                request.scope["headers"] = list(request.scope["headers"]) + [
+                    (b"x-rollout-id", rollout_id.encode()),
+                    (b"x-attempt-id", attempt_id.encode()),
+                    (b"x-sequence-id", str(sequence_id).encode()),
+                ]
+            else:
+                logger.warning("Store is not set. Skipping sequence id allocation and header injection.")
+
+        response = await call_next(request)
+        return response
+
+
+class MessageInspectionMiddleware(BaseHTTPMiddleware):
+    """Middleware to inspect the request and response bodies.
+
+    It's for debugging purposes. Add it via "message_inspection" middleware alias.
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        ti = time.time()
+        logger.info(f"Received request with scope: {request.scope}")
+        logger.info(f"Received request with body: {await request.body()}")
+        response = await call_next(request)
+        elapsed = time.time() - ti
+        logger.info(f"Response to request took {elapsed} seconds")
+        logger.info(f"Received response with status code: {response.status_code}")
+        logger.info(f"Received response with body: {response.body}")
+        return response
+
+
+class StreamConversionMiddleware(BaseHTTPMiddleware):
+    """Middleware to convert streaming responses to non-streaming responses.
+
+    Useful for backend that only supports non-streaming responses.
+
+    LiteLLM's OpenTelemetry is also buggy with streaming responses.
+    The conversion will hopefully bypass the bug.
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        # Only process POST requests to completion endpoints
+        if request.method != "POST":
+            return await call_next(request)
+
+        # Check if it's a chat completions or messages endpoint
+        endpoint_format: Literal["openai", "anthropic", "unknown"] = "unknown"
+        if request.url.path.endswith("/chat/completions") or "/chat/completions?" in request.url.path:
+            endpoint_format = "openai"
+        elif request.url.path.endswith("/messages") or "/messages?" in request.url.path:
+            endpoint_format = "anthropic"
+        else:
+            endpoint_format = "unknown"
+
+        if endpoint_format == "unknown":
+            # Directly bypass the middleware
+            return await call_next(request)
+
+        # Read the request body
+        try:
+            json_body = await request.json()
+        except json.JSONDecodeError:
+            logger.warning(f"Request body is not valid JSON: {request.body}")
+            return await call_next(request)
+
+        # Check if streaming is requested
+        is_streaming = json_body.get("stream", False)
+
+        # Simple case: no streaming requested, just return the response
+        if not is_streaming:
+            return await call_next(request)
+
+        # Now the stream case
+        return await self._handle_stream_case(request, json_body, endpoint_format, call_next)
+
+    async def _handle_stream_case(
+        self,
+        request: Request,
+        json_body: Dict[str, Any],
+        endpoint_format: Literal["openai", "anthropic"],
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        # 1) Modify the request body to force stream=False
+        modified_json = dict(json_body)
+        modified_json["stream"] = False
+        modified_body = json.dumps(modified_json).encode("utf-8")
+
+        # 2) Build a new scope + receive that yields our modified body
+        scope: Scope = dict(request.scope)
+        # rewrite headers for accept/content-length
+        new_headers: List[Tuple[bytes, bytes]] = []
+        saw_accept = False
+        for k, v in scope["headers"]:
+            kl = k.lower()
+            if kl == b"accept":
+                saw_accept = True
+                new_headers.append((k, b"application/json"))
+            elif kl == b"content-length":
+                # replace with new length
+                continue
+            else:
+                new_headers.append((k, v))
+        if not saw_accept:
+            new_headers.append((b"accept", b"application/json"))
+        new_headers.append((b"content-length", str(len(modified_body)).encode("ascii")))
+        scope["headers"] = new_headers
+
+        # Directly modify the request body
+        # Creating a new request won't work because request is cached in the base class
+        request._body = modified_body  # type: ignore
+
+        response = await call_next(request)
+
+        buffered: Optional[bytes] = None
+        # 4) If OK, buffer the response body (it should be JSON because we forced stream=False)
+        if 200 <= response.status_code < 300:
+            try:
+                if hasattr(response, "body_iterator"):
+                    # Buffer body safely
+                    body_chunks: List[bytes] = []
+                    async for chunk in response.body_iterator:  # type: ignore
+                        body_chunks.append(chunk)  # type: ignore
+                    buffered = b"".join(body_chunks)
+                else:
+                    buffered = response.body  # type: ignore
+
+                data = json.loads(buffered or b"{}")
+
+                if endpoint_format == "anthropic":
+                    return StreamingResponse(
+                        self.anthropic_stream_generator(data),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+                    )
+                else:
+                    # openai format
+                    return StreamingResponse(
+                        self.openai_stream_generator(data),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+                    )
+            except Exception as e:
+                # If anything goes wrong, fall back to non-streaming JSON
+                logger.exception(f"Error converting to stream; returning non-stream response: {e}")
+                # Rebuild the consumed response
+                return Response(
+                    content=buffered if buffered is not None else b"",
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    media_type=response.media_type,
+                    background=response.background,
+                )
+        else:
+            return response
+
+    async def anthropic_stream_generator(self, original_response: Dict[str, Any]):
+        """Generate Anthropic SSE-formatted chunks from complete content blocks
+
+        This is a dirty hack for Anthropic-style streaming from non-streaming response.
+        The sse format is subject to change based on Anthropic's implementation.
+        If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
+        """
+        # Anthropic format - handle multiple content blocks (text + tool_use)
+        content_blocks: List[Dict[str, Any]] = original_response.get("content", [])
+        message_id = original_response.get("id", f"msg_{int(time.time() * 1000)}")
+        model = original_response.get("model", "claude")
+
+        # Send message_start event
+        message_start: Dict[str, Any] = {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": original_response.get("usage", {"input_tokens": 0, "output_tokens": 0}),
+            },
+        }
+        yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+        # Send ping to keep connection alive
+        ping = {"type": "ping"}
+        yield f"event: ping\ndata: {json.dumps(ping)}\n\n"
+
+        # Process each content block
+        for block_index, block in enumerate(content_blocks):
+            block_type = block.get("type", "text")
+
+            if block_type == "text":
+                # Handle text block
+                content = block.get("text", "")
+
+                # Send content_block_start event
+                content_block_start = {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+
+                # Stream text content in chunks
+                if content:
+                    words = content.split()
+                    chunk_size = 5
+
+                    for i in range(0, len(words), chunk_size):
+                        chunk_words = words[i : i + chunk_size]
+                        text_chunk = " ".join(chunk_words)
+
+                        # Add space after chunk unless it's the last one
+                        if i + chunk_size < len(words):
+                            text_chunk += " "
+
+                        content_block_delta = {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "text_delta", "text": text_chunk},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
+                        await asyncio.sleep(0.02)
+
+                # Send content_block_stop event
+                content_block_stop = {"type": "content_block_stop", "index": block_index}
+                yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
+
+            elif block_type == "tool_use":
+                # Handle tool_use block
+                tool_name = block.get("name", "")
+                tool_input = block.get("input", {})
+                tool_id = block.get("id", f"toolu_{int(time.time() * 1000)}")
+
+                # Send content_block_start event for tool use
+                content_block_start: Dict[str, Any] = {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+
+                # Stream tool input as JSON string chunks
+                input_json = json.dumps(tool_input)
+                chunk_size = 20  # characters per chunk for JSON
+
+                for i in range(0, len(input_json), chunk_size):
+                    json_chunk = input_json[i : i + chunk_size]
+
+                    content_block_delta = {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "input_json_delta", "partial_json": json_chunk},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
+                    await asyncio.sleep(0.01)
+
+                # Send content_block_stop event
+                content_block_stop = {"type": "content_block_stop", "index": block_index}
+                yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
+
+        # Send message_delta event with stop reason
+        message_delta = {
+            "type": "message_delta",
+            "delta": {"stop_reason": original_response.get("stop_reason", "end_turn"), "stop_sequence": None},
+            "usage": {"output_tokens": original_response.get("usage", {}).get("output_tokens", 0)},
+        }
+        yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+
+        # Send message_stop event
+        message_stop = {"type": "message_stop"}
+        yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+
+    async def openai_stream_generator(self, response_json: Dict[str, Any]) -> AsyncGenerator[str, Any]:
+        """
+        Convert a *complete* OpenAI chat.completions choice into a stream of
+        OpenAI-compatible SSE chunks.
+
+        This emits:
+
+          - an initial delta with the role ("assistant"),
+          - a sequence of deltas for message.content (split into small chunks),
+          - deltas for any tool_calls (including id/name and chunked arguments),
+          - a terminal chunk with finish_reason,
+          - and finally the literal '[DONE]'.
+
+        Notes:
+
+        - We only handle a *single* choice (index 0 typically).
+        - We purposefully don't attempt to stream logprobs.
+        - Chunking strategy is simple and conservative to avoid splitting
+          multi-byte characters: we slice on spaces where possible, then fall
+          back to fixed-size substrings.
+        """
+        choice = cast(Dict[str, Any], (response_json.get("choices") or [{}])[0])
+        model = response_json.get("model", "unknown")
+        created: int = int(time.time())
+        index: int = choice.get("index", 0)
+
+        message: Dict[str, Any] = choice.get("message", {}) or {}
+        role: str = message.get("role", "assistant")
+        content: str = message.get("content") or ""
+        tool_calls: List[Any] = message.get("tool_calls") or []
+        finish_reason: Optional[str] = choice.get(
+            "finish_reason"
+        )  # e.g., "stop", "length", "tool_calls", "content_filter"
+
+        def sse_chunk(obj: Dict[str, Any]) -> str:
+            return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+        # 1) initial chunk with the role
+        yield sse_chunk(
+            {
+                "id": f"chatcmpl-{created}",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": index, "delta": {"role": role}, "finish_reason": None}],
+            }
+        )
+
+        # 2) stream textual content as small deltas
+        async def stream_content(text: str):
+            if not text:
+                return
+            # prefer splitting on spaces in ~20–40 char pieces
+            approx = 28
+            start = 0
+            n = len(text)
+            while start < n:
+                end = min(start + approx, n)
+                if end < n:
+                    # try to break on a space going forward
+                    space = text.rfind(" ", start, end)
+                    if space > start:
+                        end = space + 1
+                delta_text = text[start:end]
+                start = end
+                if not delta_text:
+                    break
+                yield sse_chunk(
+                    {
+                        "id": f"chatcmpl-{created}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": index, "delta": {"content": delta_text}, "finish_reason": None}],
+                    }
+                )
+                # tiny pause helps some UIs animate smoothly; keep very small
+                await asyncio.sleep(0.0)
+
+        async for piece in stream_content(content):  # type: ignore[misc]
+            yield piece  # pass through the produced chunks
+
+        # 3) stream tool_calls if present (id/name first, then arguments piecemeal)
+        for tc_index, tc in enumerate(tool_calls):
+            tc_type = tc.get("type", "function")
+            tc_id = tc.get("id") or f"call_{created}_{tc_index}"
+            fn: Dict[str, Any] = (tc.get("function") or {}) if tc_type == "function" else {}
+            fn_name: str = fn.get("name", "")
+            fn_args: str = fn.get("arguments", "") or ""
+
+            # (a) delta that announces the tool call id/type/name
+            yield sse_chunk(
+                {
+                    "id": f"chatcmpl-{created}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": index,
+                            "delta": {
+                                "tool_calls": [
+                                    {"index": tc_index, "id": tc_id, "type": tc_type, "function": {"name": fn_name}}
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+
+            # (b) stream arguments in small substrings
+            arg_chunk_size = 40
+            for pos in range(0, len(fn_args), arg_chunk_size):
+                partial = fn_args[pos : pos + arg_chunk_size]
+                yield sse_chunk(
+                    {
+                        "id": f"chatcmpl-{created}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": index,
+                                "delta": {"tool_calls": [{"index": tc_index, "function": {"arguments": partial}}]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                await asyncio.sleep(0.0)
+
+        # 4) terminal chunk with finish_reason (default to "stop" if missing)
+        yield sse_chunk(
+            {
+                "id": f"chatcmpl-{created}",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": index,
+                        "delta": {},
+                        "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
+                    }
+                ],
+            }
+        )
+
+        # 5) literal DONE sentinel
+        yield "data: [DONE]\n\n"
+
+
+_MIDDLEWARE_REGISTRY: Dict[str, Type[BaseHTTPMiddleware]] = {
+    "rollout_attempt": RolloutAttemptMiddleware,
+    "stream_conversion": StreamConversionMiddleware,
+    "message_inspection": MessageInspectionMiddleware,
+}
+
+
+_CALLBACK_REGISTRY = {
+    "return_token_ids": AddReturnTokenIds,
+    "logprobs": AddLogprobs,
+    "opentelemetry": LightningOpenTelemetry,
+}
 
 
 class LLMProxy:
@@ -494,46 +1020,126 @@ class LLMProxy:
     * [`stop()`][agentlightning.LLMProxy.stop] tears down the server and removes the temp config file.
     * [`restart()`][agentlightning.LLMProxy.restart] convenience wrapper to stop then start.
 
-    Usage Note:
-    As the LLM Proxy sets up an OpenTelemetry tracer, it's recommended to run it in a different
-    process from the main runner (i.e., tracer from agents).
+    !!! note
+
+        As the LLM Proxy sets up an OpenTelemetry tracer, it's recommended to run it in a different
+        process from the main runner (i.e., tracer from agents). See `launch_mode` for how to change that.
 
     !!! warning
 
-        The LLM Proxy does support streaming, but the tracing is still problematic when streaming is enabled.
+        By default (or when "stream_conversion" middleware is enabled), the LLM Proxy will convert OpenAI and Anthropic requests with `stream=True`
+        to a non-streaming request before going through the LiteLLM proxy. This is because the OpenTelemetry tracer provided by
+        LiteLLM is buggy with streaming responses. You can disable this by removing the "stream_conversion" middleware.
+        In that case, you might lose some tracing information like token IDs.
+
+    !!! danger
+
+        Do not run LLM proxy in the same process as the main runner. It's easy to cause conflicts in the tracer provider
+        with tracers like [`AgentOpsTracer`][agentlightning.AgentOpsTracer].
 
     Args:
-        port: TCP port to bind.
+        port: TCP port to bind. Will bind to a random port if not provided.
         model_list: LiteLLM `model_list` entries.
         store: LightningStore used for span sequence and persistence.
-        host: Publicly reachable host used in resource endpoints. Defaults to best-guess IPv4.
+        host: Publicly reachable host used in resource endpoints. See `host` of `launcher_args` for more details.
         litellm_config: Extra LiteLLM proxy config merged with `model_list`.
         num_retries: Default LiteLLM retry count injected into `litellm_settings`.
+        num_workers: Number of workers to run in the server. Only applicable for "mp" launch mode. Ignored if launcher_args is provided.
+            When `num_workers > 1`, the server will be run using [gunicorn](https://gunicorn.org/).
+        launch_mode: Launch mode for the server. Defaults to "mp". Cannot be used together with launcher_args. Ignored if launcher_args is provided.
+            It's recommended to use `launch_mode="mp"` to launch the proxy, which will launch the server in a separate process.
+            `launch_mode="thread"` can also be used if used in caution. It will launch the server in a separate thread.
+            `launch_mode="asyncio"` launches the server in the current thread as an asyncio task.
+            It is NOT recommended because it often causes hanging requests. Only use it if you know what you are doing.
+        launcher_args: Arguments for the server launcher. If this is provided, host, port, and launch_mode will be ignored. Cannot be used together with port, host, and launch_mode.
+        middlewares: List of FastAPI middleware classes or strings to register. You can specify the class aliases or classes that have been imported.
+            If not provided, the default middlewares (RolloutAttemptMiddleware and StreamConversionMiddleware) will be used.
+            Available middleware aliases are: "rollout_attempt", "stream_conversion", "message_inspection".
+            Middlewares are the **first layer** of request processing. They are applied to all requests before the LiteLLM proxy.
+        callbacks: List of LiteLLM callback classes or strings to register. You can specify the class aliases or classes that have been imported.
+            If not provided, the default callbacks (AddReturnTokenIds and LightningOpenTelemetry) will be used.
+            Available callback aliases are: "return_token_ids", "opentelemetry", "logprobs".
     """
 
     def __init__(
         self,
-        port: int,
+        port: int | None = None,
         model_list: List[ModelConfig] | None = None,
         store: Optional[LightningStore] = None,
         host: str | None = None,
         litellm_config: Dict[str, Any] | None = None,
         num_retries: int = 0,
+        num_workers: int = 1,
+        launch_mode: LaunchMode = "mp",
+        launcher_args: PythonServerLauncherArgs | None = None,
+        middlewares: Sequence[Union[Type[BaseHTTPMiddleware], str]] | None = None,
+        callbacks: Sequence[Union[Type[CustomLogger], str]] | None = None,
     ):
         self.store = store
-        self.host = host or _get_default_ipv4_address()
-        self.port = port
+
+        if launcher_args is not None and (
+            port is not None or host is not None or launch_mode != "mp" or num_workers != 1
+        ):
+            raise ValueError("port, host, launch_mode, and num_workers cannot be set when launcher_args is provided.")
+
+        self.server_launcher_args = launcher_args or PythonServerLauncherArgs(
+            port=port,
+            host=host,
+            launch_mode=launch_mode,
+            n_workers=num_workers,
+            # NOTE: This /health endpoint can be slow sometimes because it actually probes the backend LLM service.
+            healthcheck_url="/health",
+            startup_timeout=60.0,
+        )
+
+        if self.server_launcher_args.healthcheck_url is None:
+            logger.warning("healthcheck_url is not set. LLM Proxy will not be checked for healthiness after starting.")
+
         self.model_list = model_list or []
         self.litellm_config = litellm_config or {}
 
         # Ensure num_retries is present inside the litellm_settings block.
         self.litellm_config.setdefault("litellm_settings", {})
         self.litellm_config["litellm_settings"].setdefault("num_retries", num_retries)
+        self.server_launcher = PythonServerLauncher(app, self.server_launcher_args, noop_context())
 
-        self._server_thread = None
         self._config_file = None
-        self._uvicorn_server = None
-        self._ready_event = threading.Event()
+
+        self.middlewares: List[Type[BaseHTTPMiddleware]] = []
+        if middlewares is None:
+            middlewares = ["rollout_attempt", "stream_conversion"]
+        for middleware in middlewares:
+            if isinstance(middleware, str):
+                if middleware not in _MIDDLEWARE_REGISTRY:
+                    raise ValueError(
+                        f"Invalid middleware alias: {middleware}. Available aliases are: {list(_MIDDLEWARE_REGISTRY.keys())}"
+                    )
+                middleware = _MIDDLEWARE_REGISTRY[middleware]
+                self.middlewares.append(middleware)
+            else:
+                self.middlewares.append(middleware)
+
+        self.callbacks: List[Type[CustomLogger]] = []
+        if callbacks is None:
+            callbacks = ["return_token_ids", "opentelemetry"]
+        for callback in callbacks:
+            if isinstance(callback, str):
+                if callback not in _CALLBACK_REGISTRY:
+                    raise ValueError(
+                        f"Invalid callback alias: {callback}. Available aliases are: {list(_CALLBACK_REGISTRY.keys())}"
+                    )
+                callback = _CALLBACK_REGISTRY[callback]
+                self.callbacks.append(callback)
+            else:
+                self.callbacks.append(callback)
+
+    def get_store(self) -> Optional[LightningStore]:
+        """Get the store used by the proxy.
+
+        Returns:
+            The store used by the proxy.
+        """
+        return self.store
 
     def set_store(self, store: LightningStore) -> None:
         """Set the store for the proxy.
@@ -544,67 +1150,70 @@ class LLMProxy:
         self.store = store
 
     def update_model_list(self, model_list: List[ModelConfig]) -> None:
-        """Replace the in-memory model list and hot-restart if running.
+        """Replace the in-memory model list.
 
         Args:
             model_list: New list of model entries.
         """
         self.model_list = model_list
         logger.info(f"Updating LLMProxy model list to: {model_list}")
-        if self.is_running():
-            self.restart()
         # Do nothing if the server is not running.
 
-    def update_port(self, port: int) -> None:
-        """Update the port for the proxy.
+    def initialize(self):
+        """Initialize global middleware and LiteLLM callbacks.
 
-        Args:
-            port: The new port to use for the proxy.
+        Installs:
+
+        * A FastAPI middleware that rewrites /rollout/{rid}/attempt/{aid}/... paths,
+        injects rollout/attempt/sequence headers, and forwards downstream.
+        * LiteLLM callbacks for token ids and OpenTelemetry export.
+
+        The middleware can only be installed once because once the FastAPI app has started,
+        the middleware cannot be changed any more.
+
+        This function does not start any server. It only wires global hooks.
         """
-        self.port = port
+        if self.store is None:
+            raise ValueError("Store is not set. Please set the store before initializing the LLMProxy.")
 
-    def _wait_until_started(self, startup_timeout: float = 20.0):
-        """Block until the uvicorn server reports started or timeout.
+        if _global_llm_proxy is not None:
+            logger.warning("A global LLMProxy is already set. Overwriting it with the new instance.")
 
-        Args:
-            startup_timeout: Maximum seconds to wait.
+        # Patch for LiteLLM v1.80.6+: https://github.com/BerriAI/litellm/issues/17243
+        os.environ["USE_OTEL_LITELLM_REQUEST_SPAN"] = "true"
+
+        # Set the global LLMProxy reference for middleware/exporter access.
+        set_active_llm_proxy(self)
+
+        # Install middleware if it's not already installed.
+        installation_status: Dict[Any, bool] = {}
+        for mw in app.user_middleware:
+            installation_status[mw.cls] = True
+
+        for mw in self.middlewares:
+            if mw not in installation_status:
+                logger.info(f"Adding middleware {mw} to the FastAPI app.")
+                app.add_middleware(mw)
+            else:
+                logger.info(f"Middleware {mw} is already installed. Will not install a new one.")
+
+        if not initialize_llm_callbacks(self.callbacks):
+            # If it's not the first time to initialize the callbacks, also
+            # reset LiteLLM's logging worker so its asyncio.Queue binds to the new loop.
+            _reset_litellm_logging_worker()
+
+    @asynccontextmanager
+    async def _serve_context(self) -> AsyncGenerator[None, None]:
+        """Context manager to serve the proxy server.
+
+        See [`start`][agentlightning.LLMProxy.start] and [`stop`][agentlightning.LLMProxy.stop] for more details.
         """
-        start = time.time()
-        while True:
-            if self._uvicorn_server is None:
-                break
-            if self._uvicorn_server.started:
-                self._ready_event.set()
-                break
-            if self._uvicorn_server.should_exit:
-                break
-            if time.time() - start > startup_timeout:
-                break
-            time.sleep(0.01)
-
-    def start(self):
-        """Start the proxy server thread and initialize global wiring.
-
-        Side effects:
-
-        * Sets the module-level global store for middleware/exporter access.
-        * Calls `initialize()` once to register middleware and callbacks.
-        * Writes a temporary YAML config consumed by LiteLLM worker.
-        * Launches uvicorn in a daemon thread and waits for readiness.
-        """
-        if self.is_running():
-            # Trigger restart
-            self.stop()
 
         if not self.store:
             raise ValueError("Store is not set. Please set the store before starting the LLMProxy.")
 
-        global _global_store
-
-        _global_store = self.store
-
-        # Initialize global middleware and callbacks once.
-        initialize()
+        # Initialize global middleware and callbacks.
+        self.initialize()
 
         # Persist a temp worker config for LiteLLM and point the proxy at it.
         self._config_file = tempfile.NamedTemporaryFile(suffix=".yaml", delete=False).name
@@ -619,24 +1228,59 @@ class LLMProxy:
 
         save_worker_config(config=self._config_file)
 
-        # Bind to all interfaces to allow other hosts to reach it if needed.
-        self._uvicorn_server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=self.port))
-
-        def run_server():
-            # Serve uvicorn in this background thread with its own event loop.
-            assert self._uvicorn_server is not None
-            asyncio.run(self._uvicorn_server.serve())
-
-        logger.info("Starting LLMProxy server thread...")
-        self._ready_event.clear()
-        # FIXME: This thread should either be reused or the whole proxy should live in another process.
+        # NOTE: When running the _serve_context in current process, you might encounter the following problems:
         # Problem 1: in litellm worker, <Queue at 0x70f1d028cd90 maxsize=50000> is bound to a different event loop
         # Problem 2: Proxy has conflicted opentelemetry setup with the main process.
-        self._server_thread = threading.Thread(target=run_server, daemon=True)
-        self._server_thread.start()
-        self._wait_until_started()
 
-    def stop(self):
+        # Ready
+        logger.info("LLMProxy preparation is done. Will start the server.")
+        yield
+
+        # Clean up
+
+        logger.info("LLMProxy server is cleaning up.")
+
+        # Remove worker config to avoid stale references.
+        if self._config_file and os.path.exists(self._config_file):
+            os.unlink(self._config_file)
+
+        logger.info("LLMProxy server finishes.")
+
+    async def start(self):
+        """Start the proxy server thread and initialize global wiring.
+
+        Side effects:
+
+        * Sets the module-level global store for middleware/exporter access.
+        * Calls `initialize()` once to register middleware and callbacks.
+        * Writes a temporary YAML config consumed by LiteLLM worker.
+        * Launches uvicorn in a daemon thread and waits for readiness.
+        """
+        # Refresh the serve context
+        self.server_launcher.serve_context = self._serve_context()
+
+        if self.store is None:
+            raise ValueError("Store is not set. Please set the store before starting the LLMProxy.")
+
+        store_capabilities = self.store.capabilities
+        if self.server_launcher.args.launch_mode == "mp" and not store_capabilities.get("zero_copy", False):
+            raise RuntimeError(
+                "The store does not support zero-copy. Please use another store, or use asyncio or thread mode to launch the server."
+            )
+        elif self.server_launcher.args.launch_mode == "thread" and not store_capabilities.get("thread_safe", False):
+            raise RuntimeError(
+                "The store is not thread-safe. Please use another store, or use asyncio mode to launch the server."
+            )
+        elif self.server_launcher.args.launch_mode == "asyncio" and not store_capabilities.get("async_safe", False):
+            raise RuntimeError("The store is not async-safe. Please use another store.")
+
+        logger.info(
+            f"Starting LLMProxy server in {self.server_launcher.args.launch_mode} mode with store capabilities: {store_capabilities}"
+        )
+
+        await self.server_launcher.start()
+
+    async def stop(self):
         """Stop the proxy server and clean up temporary artifacts.
 
         This is a best-effort graceful shutdown with a bounded join timeout.
@@ -645,43 +1289,19 @@ class LLMProxy:
             logger.warning("LLMProxy is not running. Nothing to stop.")
             return
 
-        # Remove worker config to avoid stale references.
-        if self._config_file and os.path.exists(self._config_file):
-            os.unlink(self._config_file)
+        await self.server_launcher.stop()
 
-        logger.info("Stopping LLMProxy server thread...")
-        stop_success = True
-        if self._server_thread is not None and self._uvicorn_server is not None and self._uvicorn_server.started:
-            self._uvicorn_server.should_exit = True
-            self._server_thread.join(timeout=10.0)  # Allow time for graceful shutdown.
-            if self._server_thread.is_alive():
-                logger.error(
-                    "LLMProxy server thread is still alive after 10 seconds. Cannot kill it because it's a thread."
-                )
-                stop_success = False
-            self._server_thread = None
-            self._uvicorn_server = None
-            self._config_file = None
-            self._ready_event.clear()
-            if not _check_port(self.host, self.port):
-                logger.error(f"Port {self.port} is still in use. Stopping LLMProxy is not successful.")
-                stop_success = False
-        if stop_success:
-            logger.info("LLMProxy server thread stopped.")
-        else:
-            logger.error("LLMProxy server is not stopped successfully.")
-
-    def restart(self, *, _port: int | None = None) -> None:
+    async def restart(self, *, _port: int | None = None) -> None:
         """Restart the proxy if running, else start it.
 
         Convenience wrapper calling `stop()` followed by `start()`.
         """
         logger.info("Restarting LLMProxy server...")
         if self.is_running():
-            self.stop()
+            await self.stop()
         if _port is not None:
-            self.port = _port
-        self.start()
+            self.server_launcher_args.port = _port
+        await self.start()
 
     def is_running(self) -> bool:
         """Return whether the uvicorn server is active.
@@ -689,7 +1309,7 @@ class LLMProxy:
         Returns:
             bool: True if server was started and did not signal exit.
         """
-        return self._uvicorn_server is not None and self._uvicorn_server.started
+        return self.server_launcher.is_running()
 
     def as_resource(
         self,
@@ -707,7 +1327,7 @@ class LLMProxy:
             rollout_id: Rollout identifier used for span attribution. If None, will instantiate a ProxyLLM resource.
             attempt_id: Attempt identifier used for span attribution. If None, will instantiate a ProxyLLM resource.
             model: Logical model name to use. If omitted and exactly one model
-                is configured, that model is used.
+                is configured or all models have the same name, that model is used.
             sampling_parameters: Optional default sampling parameters.
 
         Returns:
@@ -719,20 +1339,26 @@ class LLMProxy:
         if model is None:
             if len(self.model_list) == 1:
                 model = self.model_list[0]["model_name"]
+            elif len(self.model_list) == 0:
+                raise ValueError("No models found in model_list. Please specify the model.")
             else:
-                raise ValueError(
-                    f"Multiple or zero models found in model_list: {self.model_list}. Please specify the model."
-                )
+                first_model_name = self.model_list[0]["model_name"]
+                if all(model_config["model_name"] == first_model_name for model_config in self.model_list):
+                    model = first_model_name
+                else:
+                    raise ValueError(
+                        f"Multiple models found in model_list: {self.model_list}. Please specify the model."
+                    )
 
         if rollout_id is None and attempt_id is None:
             return ProxyLLM(
-                endpoint=f"http://{self.host}:{self.port}",
+                endpoint=self.server_launcher.access_endpoint,
                 model=model,
                 sampling_parameters=dict(sampling_parameters or {}),
             )
         elif rollout_id is not None and attempt_id is not None:
             return LLM(
-                endpoint=f"http://{self.host}:{self.port}/rollout/{rollout_id}/attempt/{attempt_id}",
+                endpoint=f"{self.server_launcher.access_endpoint}/rollout/{rollout_id}/attempt/{attempt_id}",
                 model=model,
                 sampling_parameters=dict(sampling_parameters or {}),
             )
@@ -740,30 +1366,89 @@ class LLMProxy:
             raise ValueError("Either rollout_id and attempt_id must be provided, or neither.")
 
 
-def _get_default_ipv4_address() -> str:
-    """Determine the default outbound IPv4 address for this machine.
+_global_llm_proxy: Optional[LLMProxy] = None
+_callbacks_before_litellm_start: Optional[List[Any]] = None
 
-    Implementation:
-        Opens a UDP socket and "connects" to a public address to force route
-        selection, then inspects the socket's local address. No packets are sent.
+
+def get_active_llm_proxy() -> LLMProxy:
+    """Get the current global LLMProxy instance.
 
     Returns:
-        str: Best-guess IPv4 like `192.168.x.y`. Falls back to `127.0.0.1`.
+        Optional[LLMProxy]: The current LLMProxy if set, else None.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # Doesn't actually contact 8.8.8.8; just forces the OS to pick a route.
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+    if _global_llm_proxy is None:
+        raise ValueError("Global LLMProxy is not set. Please call llm_proxy.start() first.")
+    return _global_llm_proxy
 
 
-def _check_port(host: str, port: int) -> bool:
-    """Check if a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(1)
-        result = s.connect_ex((host, port))
-        return result != 0  # True if unavailable
+def set_active_llm_proxy(proxy: LLMProxy) -> None:
+    """Set the current global LLMProxy instance.
+
+    Args:
+        proxy: The LLMProxy instance to set as global.
+    """
+    global _global_llm_proxy
+    _global_llm_proxy = proxy
+
+
+def initialize_llm_callbacks(callback_classes: List[Type[CustomLogger]]) -> bool:
+    """Restore `litellm.callbacks` to a state that is just initialized by agent-lightning.
+
+    When litellm is restarted multiple times in the same process, more and more callbacks
+    will be appended to `litellm.callbacks`, which may exceed the MAX_CALLBACKS limit.
+    This function remembers the initial state of `litellm.callbacks` and always restore to that state.
+
+    Args:
+        callback_classes: List of callback classes to register.
+
+    Returns:
+        Whether the callbacks are initialized for the first time.
+    """
+    global _callbacks_before_litellm_start
+
+    if _callbacks_before_litellm_start is None:
+        litellm.callbacks.extend([cls() for cls in callback_classes])  # type: ignore
+        _callbacks_before_litellm_start = [*litellm.callbacks]  # type: ignore
+        return True
+
+    else:
+        # Put whatever is missing in the new callback classes to the existing callbacks.
+        for cls in callback_classes:
+            if not any(isinstance(cb, cls) for cb in _callbacks_before_litellm_start):
+                logger.info(f"Adding missing callback {cls} to the existing callbacks.")
+                _callbacks_before_litellm_start.append(cls())
+
+    _reset_litellm_logging_callback_manager()
+
+    if LightningOpenTelemetry in callback_classes:
+        # Check if tracer provider is malformed due to global tracer clear in tests.
+        if not _check_tracer_provider():
+            logger.warning(
+                "Global tracer provider might have been cleared outside. Re-initializing OpenTelemetry callback."
+            )
+            _callbacks_before_litellm_start = [
+                cb for cb in _callbacks_before_litellm_start if not isinstance(cb, LightningOpenTelemetry)
+            ] + [LightningOpenTelemetry()]
+        else:
+            logger.debug("Global tracer provider is valid. Reusing existing OpenTelemetry callback.")
+    # Otherwise, we just skip the check for opentelemetry and use the existing callback.
+
+    litellm.callbacks.clear()  # type: ignore
+    litellm.callbacks.extend(_callbacks_before_litellm_start)  # type: ignore
+    return False
+
+
+def _check_tracer_provider() -> bool:
+    """Check if the global tracer provider is properly initialized.
+
+    We don't guarantee the tracer provider is our tracer provider.
+
+    Returns:
+        bool: True if the tracer provider is valid, else False.
+    """
+    if (
+        hasattr(trace_api, "_TRACER_PROVIDER")
+        and trace_api._TRACER_PROVIDER is not None  # pyright: ignore[reportPrivateUsage]
+    ):
+        return True
+    return False

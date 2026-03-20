@@ -7,21 +7,43 @@ APO with textual gradients that read rollout spans and outputs to modify the pro
 - rollout: same pattern as your example, but task is a dict (T_task)
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Counter, Dict, Generic, Iterator, List, Optional, Sequence, Set, Tuple, TypedDict, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Counter,
+    Dict,
+    Generic,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    TypeVar,
+    cast,
+)
 
 import poml
 from openai import AsyncOpenAI
 
 from agentlightning.adapter.messages import TraceToMessages
 from agentlightning.algorithm.base import Algorithm
+from agentlightning.algorithm.utils import batch_iter_over_dataset, with_llm_proxy, with_store
 from agentlightning.reward import find_final_reward
 from agentlightning.types import Dataset, NamedResources, PromptTemplate, Rollout, RolloutMode, RolloutStatus
+
+if TYPE_CHECKING:
+    from agentlightning.llm_proxy import LLMProxy
+    from agentlightning.store.base import LightningStore
 
 logger = logging.getLogger(__name__)
 
@@ -56,41 +78,6 @@ APPLY_EDIT_PROMPT_FILES = [
 ]
 
 
-def batch_iter_over_dataset(dataset: Dataset[T_task], batch_size: int) -> Iterator[Sequence[T_task]]:
-    """
-    Create an infinite iterator that yields batches from the dataset.
-
-    When batch_size >= dataset size, yields the entire shuffled dataset repeatedly.
-    When batch_size < dataset size, yields batches of the specified size, reshuffling
-    after each complete pass through the dataset.
-
-    Args:
-        dataset: The dataset to iterate over.
-        batch_size: The desired batch size.
-
-    Yields:
-        Sequences of tasks from the dataset. Each task appears at most once per epoch.
-    """
-    if batch_size >= len(dataset):
-        while True:
-            dataset_copy = [dataset[i] for i in range(len(dataset))]
-            random.shuffle(dataset_copy)
-            yield dataset_copy
-
-    else:
-        current_batch: List[int] = []
-        while True:
-            indices = list(range(len(dataset)))
-            random.shuffle(indices)
-            for index in indices:
-                if index in current_batch:
-                    continue
-                current_batch.append(index)
-                if len(current_batch) == batch_size:
-                    yield [dataset[index] for index in current_batch]
-                    current_batch = []
-
-
 class APO(Algorithm, Generic[T_task]):
     """Automatic Prompt Optimization (APO) algorithm using textual gradients and beam search.
 
@@ -99,14 +86,16 @@ class APO(Algorithm, Generic[T_task]):
     computes critiques based on the results, and applies edits to generate improved prompts.
 
     The algorithm operates in rounds, where each round:
+
     1. Samples parent prompts from the current beam
     2. Generates new prompts by computing textual gradients and applying edits
     3. Evaluates all candidates on a validation set
     4. Selects the top-k prompts for the next round
 
     Based on the ideas from:
-    - ProTeGi: https://aclanthology.org/2023.emnlp-main.494.pdf
-    - TextGrad: https://github.com/zou-group/textgrad
+
+    - [ProTeGi](https://aclanthology.org/2023.emnlp-main.494.pdf)
+    - [TextGrad](https://github.com/zou-group/textgrad)
     """
 
     def __init__(
@@ -123,6 +112,8 @@ class APO(Algorithm, Generic[T_task]):
         beam_rounds: int = 3,
         rollout_batch_timeout: float = 3600.0,
         run_initial_validation: bool = True,
+        gradient_prompt_files: Optional[List[Path]] = None,
+        apply_edit_prompt_files: Optional[List[Path]] = None,
         # Internal flags for debugging
         _poml_trace: bool = False,
     ):
@@ -143,6 +134,8 @@ class APO(Algorithm, Generic[T_task]):
             rollout_batch_timeout: Maximum time in seconds to wait for rollout batch completion.
             run_initial_validation: If True, runs validation on the seed prompt before starting
                 optimization to establish a baseline score. Defaults to True.
+            gradient_prompt_files: Prompt templates used to compute textual gradients (critiques).
+            apply_edit_prompt_files: Prompt templates used to apply edits based on critiques.
         """
         self.async_openai_client = async_openai_client
         self.gradient_model = gradient_model
@@ -155,6 +148,8 @@ class APO(Algorithm, Generic[T_task]):
         self.beam_rounds = beam_rounds
         self.rollout_batch_timeout = rollout_batch_timeout
         self.run_initial_validation = run_initial_validation
+        self.gradient_prompt_files = gradient_prompt_files or GRADIENT_PROMPT_FILES
+        self.apply_edit_prompt_files = apply_edit_prompt_files or APPLY_EDIT_PROMPT_FILES
 
         self._history_best_prompt: Optional[PromptTemplate] = None
         self._history_best_score: float = float("-inf")
@@ -281,7 +276,7 @@ class APO(Algorithm, Generic[T_task]):
         Returns:
             A textual critique generated by the LLM, or None if generation fails.
         """
-        tg_template = random.choice(GRADIENT_PROMPT_FILES)
+        tg_template = random.choice(self.gradient_prompt_files)
 
         if len(rollout_results) < self.gradient_batch_size:
             self._log(
@@ -337,6 +332,7 @@ class APO(Algorithm, Generic[T_task]):
         Generate an improved prompt by computing a textual gradient and applying an edit.
 
         This is the main optimization step that:
+
         1. Computes a critique (textual gradient) based on rollout performance
         2. Uses another LLM to apply the critique and generate an improved prompt
 
@@ -362,7 +358,7 @@ class APO(Algorithm, Generic[T_task]):
             return current_prompt.prompt_template.template
 
         # 2) Apply edit
-        ae_template = random.choice(APPLY_EDIT_PROMPT_FILES)
+        ae_template = random.choice(self.apply_edit_prompt_files)
         self._log(
             logging.INFO,
             f"Edit will be generated by {self.apply_edit_model} with template: {ae_template.name}",
@@ -391,8 +387,10 @@ class APO(Algorithm, Generic[T_task]):
             )
         return new_prompt
 
+    @with_store
     async def get_rollout_results(
         self,
+        store: LightningStore,
         rollout: List[Rollout],
         *,
         prefix: Optional[str] = None,
@@ -410,7 +408,6 @@ class APO(Algorithm, Generic[T_task]):
             List of rollout results formatted for APO processing.
         """
         rollout_results: List[RolloutResultForAPO] = []
-        store = self.get_store()
         adapter = self.get_adapter()
         for r in rollout:
             spans = await store.query_spans(r.rollout_id)
@@ -443,6 +440,7 @@ class APO(Algorithm, Generic[T_task]):
         Evaluate a prompt on a batch of tasks by running rollouts and computing average reward.
 
         This method:
+
         1. Adds the prompt as a named resource to the store
         2. Enqueues rollouts for each task in the dataset
         3. Waits for rollouts to complete (with timeout)
@@ -587,6 +585,7 @@ class APO(Algorithm, Generic[T_task]):
         Generate new candidate prompts from parents using textual gradients.
 
         For each parent prompt, generates branch_factor new candidates by:
+
         1. Evaluating the parent on a training batch
         2. Computing textual gradient
         3. Applying edit to generate improved prompt
@@ -805,8 +804,12 @@ class APO(Algorithm, Generic[T_task]):
                 prefix=prefix,
             )
 
+    @with_llm_proxy()
+    @with_store
     async def run(
         self,
+        store: LightningStore,  # Injected by decorator - callers should not provide this parameter
+        llm_proxy: Optional[LLMProxy],  # Injected by decorator - callers should not provide this parameter
         train_dataset: Optional[Dataset[T_task]] = None,
         val_dataset: Optional[Dataset[T_task]] = None,
     ) -> None:
@@ -814,6 +817,7 @@ class APO(Algorithm, Generic[T_task]):
         Execute the APO algorithm to optimize prompts through beam search with textual gradients.
 
         The algorithm performs iterative prompt optimization over multiple rounds:
+
         - Each round: samples parent prompts, generates new candidates via textual gradients,
           evaluates all candidates on validation data, and keeps the top performers
         - Tracks the historically best prompt across all rounds

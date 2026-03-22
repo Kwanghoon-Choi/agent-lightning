@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from contextlib import contextmanager
 from copy import deepcopy
@@ -43,6 +44,9 @@ from .daemon import AgentModeDaemon
 __all__ = [
     "AgentLightningTrainer",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -374,6 +378,16 @@ class AgentLightningTrainer(RayPPOTrainer):
                 batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
             )
             batch = batch[keep_indices]
+            if len(batch) == 0:
+                metrics["training/skipped_empty_batch"] = 1
+                metrics["training/skipped_empty_batch_reason_all_prompts_dropped"] = 1
+                logger.warning(
+                    "Skipping empty training batch: all prompts were dropped as overlong "
+                    "(n_triplets_prompt_too_long=%s, max_prompt_length=%s)",
+                    metrics["training/n_triplets_prompt_too_long"],
+                    self.config.data.max_prompt_length,
+                )
+                return metrics
             # next, round to minibatch size
             mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             n_transition = len(batch)
@@ -383,6 +397,16 @@ class AgentLightningTrainer(RayPPOTrainer):
             n_remained_transition = n_transition // mini_batch_size * mini_batch_size
             batch = batch[list(range(n_remained_transition))]
             metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition
+            if len(batch) == 0:
+                metrics["training/skipped_empty_batch"] = 1
+                metrics["training/skipped_empty_batch_reason_minibatch_floor"] = 1
+                logger.warning(
+                    "Skipping empty training batch: %s transitions remained after prompt filtering, "
+                    "but ppo_mini_batch_size=%s floored the batch to zero.",
+                    n_transition,
+                    mini_batch_size,
+                )
+                return metrics
 
             # Agent mode note: Change the order of balance batch;
             #     1. first calculate advantage

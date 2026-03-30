@@ -38,6 +38,7 @@ from verl.utils.tracking import Tracking
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store.base import LightningStore
+from algorithms.gigpo import core_gigpo
 
 from .daemon import AgentModeDaemon
 
@@ -66,7 +67,7 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 #     (1) Dropping prompts that exceed the maximum allowed length.
 #     (2) Adjusting the batch size to be a multiple of the mini PPO size.
 # Different suffixes are used to label these two stages accordingly.
-def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str = "") -> Dict[str, Any]:
+def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str = "", use_multi_step_gae: bool = False) -> Dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -77,6 +78,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str 
     Args:
         batch: A DataProto object containing batch data with token-level scores, rewards, advantages, etc.
         use_critic: Whether to include critic-specific metrics. Defaults to True.
+        use_multi_step_gae: If True, use step-level returns/values instead of token-level.
 
     Returns:
         A dictionary of metrics including:
@@ -93,7 +95,6 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str 
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
     advantages = batch.batch["advantages"]
-    returns = batch.batch["returns"]
 
     max_response_length = batch.batch["responses"].shape[-1]
 
@@ -107,11 +108,18 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str 
     response_length = response_info["response_length"]
 
     valid_adv = torch.masked_select(advantages, response_mask)
-    valid_returns = torch.masked_select(returns, response_mask)
+    if use_multi_step_gae:
+        valid_returns = batch.batch["step_discounted_returns"]
+    else:
+        returns = batch.batch["returns"]
+        valid_returns = torch.masked_select(returns, response_mask)
 
     if use_critic:
-        values = batch.batch["values"]
-        valid_values = torch.masked_select(values, response_mask)
+        if use_multi_step_gae:
+            valid_values = batch.batch["step_values"]
+        else:
+            values = batch.batch["values"]
+            valid_values = torch.masked_select(values, response_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
@@ -294,9 +302,21 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # uid is used for algorithm like GRPO, should be aligned to data id
             batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
+            batch.non_tensor_batch["traj_uid"] = batch.non_tensor_batch["rollout_id_list"]
 
             if "response_mask" not in batch.batch:
                 batch.batch["response_mask"] = compute_response_mask(batch)
+
+            # For step-level PPO: compute discounted returns from step_rewards
+            if self.config.algorithm.adv_estimator == AdvantageEstimator.MULTI_STEP_GAE:
+                step_discounted_returns_tensor = core_gigpo.compute_step_discounted_returns(
+                    batch=batch,
+                    gamma=self.config.algorithm.gamma,
+                )
+                batch.batch["step_discounted_returns"] = step_discounted_returns_tensor
+                print(f"[STEP-PPO-DEBUG] trainer: compute_step_discounted_returns done, "
+                      f"shape={step_discounted_returns_tensor.shape}, "
+                      f"mean={step_discounted_returns_tensor.mean().item():.4f}")
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -333,7 +353,28 @@ class AgentLightningTrainer(RayPPOTrainer):
             # compute values
             if self.use_critic:
                 with _timer("values", timing_raw):
-                    values = self.critic_wg.compute_values(batch)
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.MULTI_STEP_GAE:
+                        batch.non_tensor_batch["num_critic_heads"] = np.full_like(
+                            batch.non_tensor_batch["uid"],
+                            fill_value=self.config.critic.get("num_critic_heads", 1),
+                            dtype=int,
+                        )
+                        batch.non_tensor_batch["use_bce_loss"] = np.full_like(
+                            batch.non_tensor_batch["uid"],
+                            fill_value=self.config.critic.get("use_bce_loss", False),
+                            dtype=bool,
+                        )
+                        if self.config.critic.get("use_last_token", False):
+                            batch.non_tensor_batch["use_last_token"] = np.ones_like(
+                                batch.non_tensor_batch["uid"], dtype=bool
+                            )
+                        print(f"[STEP-PPO-DEBUG] trainer: calling compute_step_values "
+                              f"(num_critic_heads={self.config.critic.get('num_critic_heads', 1)}, "
+                              f"use_bce_loss={self.config.critic.get('use_bce_loss', False)}, "
+                              f"use_last_token={self.config.critic.get('use_last_token', False)})")
+                        values = self.critic_wg.compute_step_values(batch)
+                    else:
+                        values = self.critic_wg.compute_values(batch)
                     batch = batch.union(values)
 
             # for agent mode, unpad to calculate adv
@@ -366,11 +407,15 @@ class AgentLightningTrainer(RayPPOTrainer):
                     lam=self.config.algorithm.lam,
                     num_repeat=self.config.actor_rollout_ref.rollout.n,
                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                    multi_step_ppo_target_values=self.config.critic.get(
+                        "multi_step_ppo_target_values", "discounted_return"
+                    ),
                     config=self.config.algorithm,
                 )
 
             # Calculate the metrics before processing. Refer to the comments of function `compute_data_metrics` for details.
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_before_processing"))
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_before_processing",
+                                                 use_multi_step_gae=self.config.algorithm.adv_estimator == AdvantageEstimator.MULTI_STEP_GAE))
 
             # after advantages are assigned, we begin to drop (1) long prompt (2) floor to ppo minisize
             keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
@@ -421,7 +466,15 @@ class AgentLightningTrainer(RayPPOTrainer):
             # update critic
             if self.use_critic:
                 with _timer("update_critic", timing_raw):
-                    critic_output = self.critic_wg.update_critic(batch)
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.MULTI_STEP_GAE:
+                        if self.config.critic.get("use_last_token", False):
+                            batch.non_tensor_batch["use_last_token"] = np.ones_like(
+                                batch.non_tensor_batch["uid"], dtype=bool
+                            )
+                        print(f"[STEP-PPO-DEBUG] trainer: calling update_step_critic")
+                        critic_output = self.critic_wg.update_step_critic(batch)
+                    else:
+                        critic_output = self.critic_wg.update_critic(batch)
                 critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                 metrics.update(critic_output_metrics)
 
@@ -451,7 +504,8 @@ class AgentLightningTrainer(RayPPOTrainer):
                     )
 
         # compute training metrics
-        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_after_processing"))
+        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_after_processing",
+                                             use_multi_step_gae=self.config.algorithm.adv_estimator == AdvantageEstimator.MULTI_STEP_GAE))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         # TODO: implement actual tflpo and theoretical tflpo
         n_gpus = self.resource_pool_manager.get_n_gpus()

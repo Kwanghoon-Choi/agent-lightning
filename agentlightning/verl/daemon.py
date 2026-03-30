@@ -839,9 +839,13 @@ class AgentModeDaemon:
                     "prompt_ids": t.prompt.get("token_ids", []),
                     "response_ids": t.response.get("token_ids", []),
                     "image_urls": t.prompt.get("image_urls", []),
+                    "step_reward": t.reward,  # Per-step intermediate reward (from LLM scoring via spans)
                 }
                 for t in rollout.triplets
             ]
+            print(f"[STEP-PPO-DEBUG] daemon: rollout {rollout_id[:8]}.. "
+                  f"n_triplets={len(trace_list)}, final_reward={final_reward}, "
+                  f"step_rewards={[t['step_reward'] for t in trace_list]}")
             info = {
                 "reward": final_reward,
                 "trace_list": trace_list,
@@ -865,18 +869,30 @@ class AgentModeDaemon:
         response_ids_list: List[List[int]] = []
         response_attention_mask_list: List[List[int]] = []
         reward_list: List[float] = []
+        step_reward_list: List[float] = []  # Per-step rewards for step-level PPO
         data_id_list: List[str] = []
         rollout_id_list: List[str] = []
         turn_index_list: List[int] = []
         is_drop_list: List[bool] = []
+        turn_counts: List[int] = []  # Number of turns per trajectory
         image_grid_thw_list: List[Optional[torch.Tensor]] = []  # For Qwen2-VL mrope
         n_trunc_sample_because_of_response = 0
 
         if self.trace_aggregator.get("level", "transition") == "transition":
             for rollout_id, sample_info in finished_id_to_sample_info.items():
+                turn_counts.append(len(sample_info["trace_list"]))
                 for turn_index, trace in enumerate(sample_info["trace_list"]):
 
                     reward_list.append(sample_info["reward"])
+                    # step_rewards: per-step intermediate reward from LLM scoring
+                    # (None means no intermediate reward for this step, default to 0.0)
+                    raw_step_reward = trace["step_reward"]
+                    step_reward_list.append(
+                        raw_step_reward if raw_step_reward is not None else 0.0
+                    )
+                    if raw_step_reward is None:
+                        print(f"[STEP-PPO-DEBUG] daemon: WARNING step_reward is None for "
+                              f"rollout={rollout_id[:8]}.. turn={turn_index}, defaulting to 0.0")
                     prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
 
                     # Mark samples with prompts exceeding max_prompt_length to be dropped later
@@ -1081,6 +1097,8 @@ class AgentModeDaemon:
                 "position_ids": position_ids,
                 "is_drop_mask": is_drop_mask,
                 "token_level_scores": token_level_scores.contiguous(),
+                # Step-level rewards for step-level PPO (one scalar per step/turn)
+                "step_rewards": torch.tensor(step_reward_list, dtype=torch.float32).to(device),
                 **(
                     {"response_mask": response_mask}
                     if self.trace_aggregator.get("level", "transition") == "trajectory"
@@ -1089,6 +1107,12 @@ class AgentModeDaemon:
             },  # type: ignore
             batch_size=n_transition,
         )
+        print(f"[STEP-PPO-DEBUG] daemon: batch created - n_transition={n_transition}, "
+              f"step_rewards: non_zero={sum(1 for r in step_reward_list if r != 0.0)}/{len(step_reward_list)}, "
+              f"mean={np.mean(step_reward_list):.4f}, "
+              f"reward_list(final) mean={np.mean(reward_list):.4f}")
+        if turn_counts:
+            print(f"[STEP-PPO-DEBUG] daemon: turn_counts: min={min(turn_counts)}, mean={np.mean(turn_counts):.1f}, max={max(turn_counts)}")
         data_proto = DataProto(batch=batch)
 
         data_metrics = {
@@ -1098,6 +1122,11 @@ class AgentModeDaemon:
             "training/n_rollouts_w_reward": sample_with_reward_count,
             "training/n_truncated_triplets": n_trunc_sample_because_of_response,
             "training/n_triplets": n_transition,
+            **({
+                "training/turn_count/max": np.max(turn_counts),
+                "training/turn_count/mean": np.mean(turn_counts),
+                "training/turn_count/min": np.min(turn_counts),
+            } if turn_counts else {}),
             # log data, only for debug testing
             **(
                 {
@@ -1128,6 +1157,7 @@ class AgentModeDaemon:
         # Add non-tensor data for advantage calculation and logging
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)  # type: ignore
         data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)  # type: ignore
+        data_proto.non_tensor_batch["step_rewards"] = np.array(step_reward_list)  # type: ignore
         if self.trace_aggregator.get("level", "transition") == "transition":
             data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)  # type: ignore
 

@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 from opentelemetry.sdk.trace import ReadableSpan
 from pydantic import BaseModel
 
-from agentlightning.emitter.reward import get_reward_value
+from agentlightning.emitter.reward import get_intermediate_reward_value, get_reward_value
 from agentlightning.semconv import AGL_OPERATION, AGL_REWARD, LightningSpanAttributes
 from agentlightning.types import Span, Triplet
 from agentlightning.utils.otel import filter_and_unflatten_attributes
@@ -519,6 +519,25 @@ class TraceTree:
                 self.children.remove(repair_node)
                 closest_parent.children.append(repair_node)
 
+    def _collect_intermediate_rewards(self) -> dict[int, float]:
+        """Collect intermediate rewards from descendant spans, keyed by turn index.
+
+        Intermediate reward spans carry an ``intermediate.turn_index`` attribute
+        that maps directly to the transition (triplet) index in the trajectory.
+
+        Returns:
+            Mapping from turn index to intermediate reward value.
+        """
+        result: dict[int, float] = {}
+        for node in self.traverse():
+            value = get_intermediate_reward_value(node.span)
+            if value is not None:
+                attrs = node.span.attributes or {}
+                turn_index = attrs.get("intermediate.turn_index")
+                if turn_index is not None:
+                    result[int(turn_index)] = value
+        return result
+
     def match_rewards(self, reward_match: str, llm_calls: List["TraceTree"]) -> dict[str, Optional[float]]:
         """Assign rewards to previously matched LLM calls.
 
@@ -755,6 +774,17 @@ class TraceTree:
         if final_reward is not None and len(transitions) > 0:
             # Add the final reward to the last transition
             transitions[-1] = transitions[-1].model_copy(update={"reward": final_reward})
+
+        # Apply intermediate rewards to transitions that have no reward yet.
+        # Intermediate reward spans carry ``intermediate.turn_index`` which maps
+        # 1:1 to the transition index.  Final-reward transitions are left untouched.
+        intermediate_rewards = self._collect_intermediate_rewards()
+        for turn_index, ir_value in intermediate_rewards.items():
+            if turn_index < len(transitions) and transitions[turn_index].reward is None:
+                transitions[turn_index] = transitions[turn_index].model_copy(
+                    update={"reward": ir_value}
+                )
+
         return transitions
 
     def __repr__(self):

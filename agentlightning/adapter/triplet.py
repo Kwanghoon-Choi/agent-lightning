@@ -778,12 +778,19 @@ class TraceTree:
         # Apply intermediate rewards to transitions that have no reward yet.
         # Intermediate reward spans carry ``intermediate.turn_index`` which maps
         # 1:1 to the transition index.  Final-reward transitions are left untouched.
-        intermediate_rewards = self._collect_intermediate_rewards()
-        for turn_index, ir_value in intermediate_rewards.items():
-            if turn_index < len(transitions) and transitions[turn_index].reward is None:
-                transitions[turn_index] = transitions[turn_index].model_copy(
-                    update={"reward": ir_value}
-                )
+        #
+        # Defensive guard: when STEP_PPO_USE_INTERMEDIATE_REWARDS != "true",
+        # skip this entirely so trajectories are bit-identical to the
+        # "final reward only" baseline regardless of whether stray intermediate
+        # reward spans happen to be present in the trace.
+        import os as _os
+        if _os.getenv("STEP_PPO_USE_INTERMEDIATE_REWARDS", "false").lower() == "true":
+            intermediate_rewards = self._collect_intermediate_rewards()
+            for turn_index, ir_value in intermediate_rewards.items():
+                if turn_index < len(transitions) and transitions[turn_index].reward is None:
+                    transitions[turn_index] = transitions[turn_index].model_copy(
+                        update={"reward": ir_value}
+                    )
 
         return transitions
 

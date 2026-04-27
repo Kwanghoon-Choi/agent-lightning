@@ -304,6 +304,65 @@ class AgentLightningTrainer(RayPPOTrainer):
             batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
             batch.non_tensor_batch["traj_uid"] = batch.non_tensor_batch["rollout_id_list"]
 
+            # === PATCH: salvage samples with zero valid response tokens ===
+            # Some rollouts can produce trajectories with no valid response tokens
+            # (e.g., when an LLM call fails with ContextWindowExceededError or
+            # similar errors mid-generation). Feeding such a sample into
+            # `actor_rollout_wg.compute_log_prob` triggers a fatal
+            # RuntimeError inside Qwen2 attention:
+            #   `q_proj(hidden_states).view(1, 0, -1, 128)` -> ambiguous -1.
+            # That exception kills the entire training run.
+            #
+            # To keep training alive we:
+            #   1) detect rows whose response part has attention_mask sum == 0,
+            #   2) replace the first response position with EOS so the forward
+            #      pass sees at least one valid response token,
+            #   3) mark them in `is_drop_mask` so they are filtered out by the
+            #      existing post-advantage drop step (see L421+ below) and
+            #      therefore do NOT contribute to actor / critic updates.
+            #
+            # Side-effect notes:
+            #   - These samples still go through advantage computation, so they
+            #     can perturb GRPO group mean/std slightly (1 dummy sample with
+            #     reward 0). They are dropped before any optimizer step.
+            #   - `token_level_scores` for these rows is already all-zero in
+            #     the response slice (the daemon places the reward at the
+            #     full-sequence eos index, which lies inside the prompt area
+            #     for empty-response samples and is dropped by the slicing).
+            #   - For 2D position_ids we recompute the row via cumsum so the
+            #     patched token has a correct position. For 3D (mrope / VL)
+            #     we leave position_ids alone; the sample is dropped anyway
+            #     and the only requirement is to avoid a length-0 forward.
+            response_length = batch.batch["responses"].shape[-1]
+            prompt_length = batch.batch["input_ids"].shape[-1] - response_length
+            response_attention_mask = batch.batch["attention_mask"][:, -response_length:]
+            empty_response_mask = response_attention_mask.sum(dim=-1) == 0
+            n_empty_response = int(empty_response_mask.sum().item())
+            if n_empty_response > 0:
+                eos_id = self.tokenizer.eos_token_id
+                if eos_id is None:
+                    eos_id = self.tokenizer.pad_token_id
+                empty_indices = empty_response_mask.nonzero(as_tuple=True)[0].tolist()
+                for i in empty_indices:
+                    batch.batch["responses"][i, 0] = eos_id
+                    batch.batch["input_ids"][i, prompt_length] = eos_id
+                    batch.batch["attention_mask"][i, prompt_length] = 1
+                    if batch.batch["position_ids"].dim() == 2:
+                        batch.batch["position_ids"][i] = torch.clamp(
+                            torch.cumsum(batch.batch["attention_mask"][i], dim=-1) - 1,
+                            min=0,
+                        )
+                    batch.batch["is_drop_mask"][i] = True
+                metrics["training/n_empty_response_patched"] = n_empty_response
+                logger.warning(
+                    "Patched %d sample(s) with empty responses (inserted EOS, "
+                    "set is_drop_mask=True) to avoid a fatal RuntimeError in "
+                    "compute_log_prob. Likely caused by ContextWindowExceededError "
+                    "or other rollout failures.",
+                    n_empty_response,
+                )
+            # === END PATCH ===
+
             if "response_mask" not in batch.batch:
                 batch.batch["response_mask"] = compute_response_mask(batch)
 

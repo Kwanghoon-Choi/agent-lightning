@@ -427,11 +427,56 @@ class AgentLightningTrainer(RayPPOTrainer):
                             batch.non_tensor_batch["use_last_token"] = np.ones_like(
                                 batch.non_tensor_batch["uid"], dtype=bool
                             )
+                            response_length = batch.batch["responses"].shape[-1]
+                            prompt_attention_mask = batch.batch["attention_mask"][:, :-response_length]
+                            zero_prompt_mask = prompt_attention_mask.sum(dim=-1) == 0
+                            n_zero_prompt = int(zero_prompt_mask.sum().item())
+                            if n_zero_prompt > 0:
+                                batch.batch["is_drop_mask"] = batch.batch["is_drop_mask"] | zero_prompt_mask
+                                metrics["training/n_step_value_zero_prompt_dropped"] = n_zero_prompt
+
                         print(f"[STEP-PPO-DEBUG] trainer: calling compute_step_values "
                               f"(num_critic_heads={self.config.critic.get('num_critic_heads', 1)}, "
                               f"use_bce_loss={self.config.critic.get('use_bce_loss', False)}, "
                               f"use_last_token={self.config.critic.get('use_last_token', False)})")
-                        values = self.critic_wg.compute_step_values(batch)
+                        step_value_keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
+                        n_step_value_skipped = len(batch) - int(step_value_keep_indices.shape[0])
+                        if n_step_value_skipped > 0:
+                            metrics["training/n_step_values_skipped_dropped"] = n_step_value_skipped
+                            logger.warning(
+                                "Skipping %d dropped/invalid sample(s) for step-value computation; "
+                                "their step_values will be filled with zero and they will be "
+                                "removed before critic/actor updates.",
+                                n_step_value_skipped,
+                            )
+
+                        if len(step_value_keep_indices) > 0:
+                            value_batch = batch[step_value_keep_indices]
+                            value_batch, value_pad_size = pad_dataproto_to_divisor(
+                                value_batch, self.critic_wg.world_size
+                            )
+                            values = self.critic_wg.compute_step_values(value_batch)
+                            values = unpad_dataproto(values, pad_size=value_pad_size)
+
+                            step_values = values.batch["step_values"]
+                            full_step_values = torch.zeros(
+                                len(batch),
+                                dtype=step_values.dtype,
+                                device=step_values.device,
+                            )
+                            full_step_values[step_value_keep_indices.to(step_values.device)] = step_values
+                            values = DataProto.from_dict(tensors={"step_values": full_step_values})
+                        else:
+                            metrics["training/skipped_step_values_all_dropped"] = 1
+                            values = DataProto.from_dict(
+                                tensors={
+                                    "step_values": torch.zeros(
+                                        len(batch),
+                                        dtype=torch.float32,
+                                        device=batch.batch["input_ids"].device,
+                                    )
+                                }
+                            )
                     else:
                         values = self.critic_wg.compute_values(batch)
                     batch = batch.union(values)
@@ -476,7 +521,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_before_processing",
                                                  use_multi_step_gae=self.config.algorithm.adv_estimator == AdvantageEstimator.MULTI_STEP_GAE))
 
-            # after advantages are assigned, we begin to drop (1) long prompt (2) floor to ppo minisize
+            # after advantages are assigned, we begin to drop (1) invalid samples / long prompt (2) floor to ppo minisize
             keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
             metrics["training/n_triplets_prompt_too_long"] = (
                 batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
@@ -486,7 +531,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 metrics["training/skipped_empty_batch"] = 1
                 metrics["training/skipped_empty_batch_reason_all_prompts_dropped"] = 1
                 logger.warning(
-                    "Skipping empty training batch: all prompts were dropped as overlong "
+                    "Skipping empty training batch: all samples were marked for drop "
                     "(n_triplets_prompt_too_long=%s, max_prompt_length=%s)",
                     metrics["training/n_triplets_prompt_too_long"],
                     self.config.data.max_prompt_length,

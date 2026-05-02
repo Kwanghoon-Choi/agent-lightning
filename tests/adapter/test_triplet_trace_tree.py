@@ -149,6 +149,25 @@ def reward_attributes(value: float) -> Dict[str, Any]:
     }
 
 
+def intermediate_reward_attributes(
+    value: float,
+    *,
+    turn_index: Optional[int] = None,
+    response_id: Optional[str] = None,
+    assistant_response: Optional[str] = None,
+) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {
+        "agentops.task.output": json.dumps({"type": "intermediate_reward", "value": value}),
+    }
+    if turn_index is not None:
+        attrs["intermediate.turn_index"] = turn_index
+    if response_id is not None:
+        attrs["intermediate.response_id"] = response_id
+    if assistant_response is not None:
+        attrs["intermediate.assistant_response"] = assistant_response
+    return attrs
+
+
 def make_trace_tree_root() -> TraceTree:
     """Create a minimal trace tree root for helper-only tests."""
     root_span = make_span(
@@ -334,6 +353,108 @@ def test_trace_tree_to_trajectory_skips_empty_and_dedupes_llm_calls():
     )
     assert len(with_final_reward) == 1
     assert with_final_reward[0].reward == 1.0
+
+
+def test_intermediate_reward_prefers_response_id_over_turn_index(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("STEP_PPO_USE_INTERMEDIATE_REWARDS", "true")
+
+    root = make_span("root", "session", parent_id=None, start_time=0.0, end_time=10.0)
+    agent = make_span(
+        "agent",
+        "agent.node",
+        parent_id="root",
+        start_time=1.0,
+        end_time=9.0,
+        attributes={"agent.name": "primary-agent"},
+    )
+    tool_call = make_llm_span(
+        "llm-tool",
+        parent_id="agent",
+        start=2.0,
+        end=3.0,
+        prompt_ids=[1],
+        response_ids=[2],
+        response_id="resp-tool-call",
+        extra_attrs={"gen_ai.completion.0.finish_reason": "tool_calls"},
+    )
+    assistant_text = make_llm_span(
+        "llm-text",
+        parent_id="agent",
+        start=4.0,
+        end=5.0,
+        prompt_ids=[3],
+        response_ids=[4],
+        response_id="resp-user-facing-text",
+        extra_attrs={"gen_ai.completion.0.content": "Could you confirm your reservation id?"},
+    )
+    reward = make_span(
+        "intermediate-reward",
+        "agentlightning.intermediate_reward",
+        parent_id="agent",
+        start_time=6.0,
+        end_time=6.1,
+        attributes=intermediate_reward_attributes(
+            0.7,
+            turn_index=0,
+            response_id="resp-user-facing-text",
+        ),
+    )
+
+    tree = TraceTree.from_spans([root, agent, tool_call, assistant_text, reward])
+    trajectory = tree.to_trajectory(agent_match="primary-agent")
+
+    assert [triplet.reward for triplet in trajectory] == [None, 0.7]
+
+
+def test_intermediate_reward_matches_assistant_response_text(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("STEP_PPO_USE_INTERMEDIATE_REWARDS", "true")
+
+    root = make_span("root", "session", parent_id=None, start_time=0.0, end_time=10.0)
+    agent = make_span(
+        "agent",
+        "agent.node",
+        parent_id="root",
+        start_time=1.0,
+        end_time=9.0,
+        attributes={"agent.name": "primary-agent"},
+    )
+    tool_call = make_llm_span(
+        "llm-tool",
+        parent_id="agent",
+        start=2.0,
+        end=3.0,
+        prompt_ids=[1],
+        response_ids=[2],
+        response_id="resp-tool-call",
+        extra_attrs={"gen_ai.completion.0.finish_reason": "tool_calls"},
+    )
+    assistant_text = make_llm_span(
+        "llm-text",
+        parent_id="agent",
+        start=4.0,
+        end=5.0,
+        prompt_ids=[3],
+        response_ids=[4],
+        response_id="resp-user-facing-text",
+        extra_attrs={"gen_ai.completion.0.content": "Could you confirm your reservation id?"},
+    )
+    reward = make_span(
+        "intermediate-reward",
+        "agentlightning.intermediate_reward",
+        parent_id="agent",
+        start_time=6.0,
+        end_time=6.1,
+        attributes=intermediate_reward_attributes(
+            0.6,
+            turn_index=0,
+            assistant_response="Could you confirm your reservation id?",
+        ),
+    )
+
+    tree = TraceTree.from_spans([root, agent, tool_call, assistant_text, reward])
+    trajectory = tree.to_trajectory(agent_match="primary-agent")
+
+    assert [triplet.reward for triplet in trajectory] == [None, 0.6]
 
 
 def test_tracer_trace_to_triplet_repair_required_for_agent_filter():

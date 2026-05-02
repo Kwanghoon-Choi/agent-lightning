@@ -81,6 +81,15 @@ class Transition(BaseModel):
     reward: Optional[float]
 
 
+class IntermediateRewardSpec(BaseModel):
+    """Intermediate reward target metadata collected from reward spans."""
+
+    value: float
+    turn_index: Optional[int] = None
+    response_id: Optional[str] = None
+    assistant_response: Optional[str] = None
+
+
 class RewardMatchPolicy(str, Enum):
     """Strategies for matching rewards to LLM call spans.
 
@@ -519,24 +528,93 @@ class TraceTree:
                 self.children.remove(repair_node)
                 closest_parent.children.append(repair_node)
 
-    def _collect_intermediate_rewards(self) -> dict[int, float]:
-        """Collect intermediate rewards from descendant spans, keyed by turn index.
+    def _collect_intermediate_rewards(self) -> List[IntermediateRewardSpec]:
+        """Collect intermediate rewards from descendant spans.
 
-        Intermediate reward spans carry an ``intermediate.turn_index`` attribute
-        that maps directly to the transition (triplet) index in the trajectory.
+        Intermediate reward spans can target transitions by ``intermediate.response_id``
+        or, for dialogue-progress rewards, by ``intermediate.assistant_response``.
+        ``intermediate.turn_index`` is kept as a fallback for existing emitters.
 
         Returns:
-            Mapping from turn index to intermediate reward value.
+            Intermediate reward specs in trace order.
         """
-        result: dict[int, float] = {}
+        result: list[IntermediateRewardSpec] = []
         for node in self.traverse():
             value = get_intermediate_reward_value(node.span)
             if value is not None:
                 attrs = node.span.attributes or {}
                 turn_index = attrs.get("intermediate.turn_index")
-                if turn_index is not None:
-                    result[int(turn_index)] = value
+                response_id = attrs.get("intermediate.response_id")
+                assistant_response = attrs.get("intermediate.assistant_response")
+                result.append(
+                    IntermediateRewardSpec(
+                        value=value,
+                        turn_index=int(turn_index) if turn_index is not None else None,
+                        response_id=response_id if isinstance(response_id, str) and response_id else None,
+                        assistant_response=(
+                            assistant_response
+                            if isinstance(assistant_response, str) and assistant_response.strip()
+                            else None
+                        ),
+                    )
+                )
         return result
+
+    @staticmethod
+    def _normalize_completion_text(text: str) -> str:
+        return " ".join(text.split())
+
+    @classmethod
+    def _extract_completion_text(cls, raw_content: Any) -> str:
+        text_parts: List[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, str):
+                if value.strip():
+                    text_parts.append(value.strip())
+                return
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if isinstance(value, dict):
+                content = value.get("content")
+                if isinstance(content, str) and content.strip():
+                    text_parts.append(content.strip())
+                elif isinstance(content, list):
+                    visit(content)
+                for nested_key in ("message", "delta"):
+                    nested_value = value.get(nested_key)
+                    if nested_value is not None:
+                        visit(nested_value)
+
+        visit(raw_content)
+        return "\n".join(text_parts)
+
+    @classmethod
+    def _resolve_intermediate_reward_index(
+        cls,
+        reward: IntermediateRewardSpec,
+        transitions: List[Triplet],
+        completion_text_to_indices: dict[str, List[int]],
+        text_match_offsets: dict[str, int],
+    ) -> Optional[int]:
+        if reward.response_id is not None:
+            for index, transition in enumerate(transitions):
+                if transition.metadata.get("response_id") == reward.response_id:
+                    return index
+
+        if reward.assistant_response is not None:
+            normalized_text = cls._normalize_completion_text(reward.assistant_response)
+            candidate_indices = completion_text_to_indices.get(normalized_text, [])
+            if candidate_indices:
+                offset = text_match_offsets.get(normalized_text, 0)
+                text_match_offsets[normalized_text] = offset + 1
+                if offset < len(candidate_indices):
+                    return candidate_indices[offset]
+                return candidate_indices[-1]
+
+        return reward.turn_index
 
     def match_rewards(self, reward_match: str, llm_calls: List["TraceTree"]) -> dict[str, Optional[float]]:
         """Assign rewards to previously matched LLM calls.
@@ -776,8 +854,9 @@ class TraceTree:
             transitions[-1] = transitions[-1].model_copy(update={"reward": final_reward})
 
         # Apply intermediate rewards to transitions that have no reward yet.
-        # Intermediate reward spans carry ``intermediate.turn_index`` which maps
-        # 1:1 to the transition index.  Final-reward transitions are left untouched.
+        # Prefer response id / assistant text targets so dialogue-progress rewards
+        # attach to the assistant completion they judge.  ``turn_index`` remains a
+        # fallback for older emitters.  Final-reward transitions are left untouched.
         #
         # Defensive guard: when STEP_PPO_USE_INTERMEDIATE_REWARDS != "true",
         # skip this entirely so trajectories are bit-identical to the
@@ -786,10 +865,28 @@ class TraceTree:
         import os as _os
         if _os.getenv("STEP_PPO_USE_INTERMEDIATE_REWARDS", "false").lower() == "true":
             intermediate_rewards = self._collect_intermediate_rewards()
-            for turn_index, ir_value in intermediate_rewards.items():
-                if turn_index < len(transitions) and transitions[turn_index].reward is None:
-                    transitions[turn_index] = transitions[turn_index].model_copy(
-                        update={"reward": ir_value}
+            completion_text_to_indices: dict[str, List[int]] = {}
+            for index, transition in enumerate(transitions):
+                completion_text = self._extract_completion_text(transition.response.get("raw_content"))
+                normalized_text = self._normalize_completion_text(completion_text)
+                if normalized_text:
+                    completion_text_to_indices.setdefault(normalized_text, []).append(index)
+
+            text_match_offsets: dict[str, int] = {}
+            for intermediate_reward in intermediate_rewards:
+                target_index = self._resolve_intermediate_reward_index(
+                    intermediate_reward,
+                    transitions,
+                    completion_text_to_indices,
+                    text_match_offsets,
+                )
+                if (
+                    target_index is not None
+                    and 0 <= target_index < len(transitions)
+                    and transitions[target_index].reward is None
+                ):
+                    transitions[target_index] = transitions[target_index].model_copy(
+                        update={"reward": intermediate_reward.value}
                     )
 
         return transitions

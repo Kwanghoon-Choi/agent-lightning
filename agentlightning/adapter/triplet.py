@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 from opentelemetry.sdk.trace import ReadableSpan
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agentlightning.emitter.reward import get_intermediate_reward_value, get_reward_value
 from agentlightning.semconv import AGL_OPERATION, AGL_REWARD, LightningSpanAttributes
@@ -62,6 +62,21 @@ def _attributes_unflatten_multiple(
     return None
 
 
+def _coerce_str_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return [stripped]
+        return _coerce_str_list(parsed)
+    if isinstance(value, (list, tuple)):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
 class Transition(BaseModel):
     """A single transition within a reinforcement learning trajectory.
 
@@ -88,6 +103,8 @@ class IntermediateRewardSpec(BaseModel):
     turn_index: Optional[int] = None
     response_id: Optional[str] = None
     assistant_response: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_call_ids: List[str] = Field(default_factory=list)
 
 
 class RewardMatchPolicy(str, Enum):
@@ -531,8 +548,9 @@ class TraceTree:
     def _collect_intermediate_rewards(self) -> List[IntermediateRewardSpec]:
         """Collect intermediate rewards from descendant spans.
 
-        Intermediate reward spans can target transitions by ``intermediate.response_id``
-        or, for dialogue-progress rewards, by ``intermediate.assistant_response``.
+        Intermediate reward spans can target transitions by ``intermediate.response_id``,
+        ``intermediate.tool_call_id`` / ``intermediate.tool_call_ids``, or, for
+        dialogue-progress rewards, by ``intermediate.assistant_response``.
         ``intermediate.turn_index`` is kept as a fallback for existing emitters.
 
         Returns:
@@ -546,6 +564,10 @@ class TraceTree:
                 turn_index = attrs.get("intermediate.turn_index")
                 response_id = attrs.get("intermediate.response_id")
                 assistant_response = attrs.get("intermediate.assistant_response")
+                tool_call_id = attrs.get("intermediate.tool_call_id")
+                tool_call_ids = _coerce_str_list(attrs.get("intermediate.tool_call_ids"))
+                if isinstance(tool_call_id, str) and tool_call_id.strip() and tool_call_id not in tool_call_ids:
+                    tool_call_ids.insert(0, tool_call_id.strip())
                 result.append(
                     IntermediateRewardSpec(
                         value=value,
@@ -556,6 +578,8 @@ class TraceTree:
                             if isinstance(assistant_response, str) and assistant_response.strip()
                             else None
                         ),
+                        tool_call_id=tool_call_ids[0] if tool_call_ids else None,
+                        tool_call_ids=tool_call_ids,
                     )
                 )
         return result
@@ -602,6 +626,13 @@ class TraceTree:
         if reward.response_id is not None:
             for index, transition in enumerate(transitions):
                 if transition.metadata.get("response_id") == reward.response_id:
+                    return index
+
+        if reward.tool_call_ids:
+            reward_tool_call_ids = set(reward.tool_call_ids)
+            for index, transition in enumerate(transitions):
+                transition_tool_call_ids = _coerce_str_list(transition.metadata.get("tool_call_ids"))
+                if reward_tool_call_ids.intersection(transition_tool_call_ids):
                     return index
 
         if reward.assistant_response is not None:
@@ -725,6 +756,117 @@ class TraceTree:
                             image_urls.append(image_url_dict["url"])
         return image_urls
 
+    @staticmethod
+    def _append_tool_call(
+        tool_calls: List[Dict[str, Any]],
+        *,
+        call_id: Any,
+        name: Any,
+        arguments: Any = None,
+    ) -> None:
+        call_id = call_id.strip() if isinstance(call_id, str) else None
+        name = name.strip() if isinstance(name, str) else None
+        if not call_id and not name:
+            return
+        tool_call: Dict[str, Any] = {}
+        if call_id:
+            tool_call["id"] = call_id
+        if name:
+            tool_call["name"] = name
+        if arguments is not None:
+            tool_call["arguments"] = arguments
+        tool_calls.append(tool_call)
+
+    @classmethod
+    def _extract_tool_calls_from_payload(cls, value: Any, *, within_tool_calls: bool = False) -> List[Dict[str, Any]]:
+        tool_calls: List[Dict[str, Any]] = []
+
+        def visit(item: Any, *, nested_within_tool_calls: bool = False) -> None:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped.startswith("{") or stripped.startswith("["):
+                    try:
+                        visit(json.loads(stripped), nested_within_tool_calls=nested_within_tool_calls)
+                    except json.JSONDecodeError:
+                        pass
+                return
+            if isinstance(item, list):
+                for child in item:
+                    visit(child, nested_within_tool_calls=nested_within_tool_calls)
+                return
+            if not isinstance(item, dict):
+                return
+
+            item_type = item.get("type")
+            function_payload = item.get("function")
+            if item_type == "tool_call":
+                cls._append_tool_call(
+                    tool_calls,
+                    call_id=item.get("id") or item.get("call_id") or item.get("tool_call_id"),
+                    name=item.get("name"),
+                    arguments=item.get("arguments"),
+                )
+            elif isinstance(function_payload, dict) and (nested_within_tool_calls or item.get("id")):
+                cls._append_tool_call(
+                    tool_calls,
+                    call_id=item.get("id") or item.get("call_id") or item.get("tool_call_id"),
+                    name=function_payload.get("name"),
+                    arguments=function_payload.get("arguments"),
+                )
+
+            for key, child in item.items():
+                visit(child, nested_within_tool_calls=nested_within_tool_calls or key == "tool_calls")
+
+        visit(value, nested_within_tool_calls=within_tool_calls)
+        return tool_calls
+
+    @classmethod
+    def _dedupe_tool_calls(cls, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen: set[Tuple[Optional[str], Optional[str]]] = set()
+        for tool_call in tool_calls:
+            key = (cast(Optional[str], tool_call.get("id")), cast(Optional[str], tool_call.get("name")))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(tool_call)
+        return result
+
+    @classmethod
+    def _extract_tool_calls_from_span_attributes(cls, attributes: Dict[str, Any]) -> List[Dict[str, Any]]:
+        tool_calls: List[Dict[str, Any]] = []
+
+        output_messages = attributes.get("gen_ai.output.messages")
+        if output_messages is not None:
+            tool_calls.extend(cls._extract_tool_calls_from_payload(output_messages))
+
+        for prefix in ["gen_ai.completion", "agentlightning.operation.output.choices"]:
+            try:
+                payload = filter_and_unflatten_attributes(attributes, prefix)
+            except ValueError:
+                payload = None
+            if payload:
+                tool_calls.extend(cls._extract_tool_calls_from_payload(payload))
+
+        return cls._dedupe_tool_calls(tool_calls)
+
+    @classmethod
+    def _extract_tool_calls_from_llm_node(cls, llm_call: "TraceTree") -> List[Dict[str, Any]]:
+        tool_calls = cls._extract_tool_calls_from_span_attributes(llm_call.span.attributes or {})
+        for child in llm_call.children:
+            attrs = child.span.attributes or {}
+            tool_call_id = _attributes_get_multiple(attrs, ["gen_ai.tool.call.id", "tool.call.id"])
+            tool_name = _attributes_get_multiple(attrs, ["gen_ai.tool.name", "tool.name"])
+            tool_arguments = _attributes_get_multiple(attrs, ["gen_ai.tool.call.arguments", "tool.parameters"])
+            if tool_call_id or tool_name:
+                cls._append_tool_call(
+                    tool_calls,
+                    call_id=tool_call_id,
+                    name=tool_name,
+                    arguments=tool_arguments,
+                )
+        return cls._dedupe_tool_calls(tool_calls)
+
     def span_to_triplet(self, span: Span, agent_name: str) -> Triplet:
         """Convert a span to a triplet.
 
@@ -835,6 +977,14 @@ class TraceTree:
         filtered_llm_calls: List[Tuple[TraceTree, str]] = []
         for llm_call, agent_name in llm_calls:
             triplet = self.span_to_triplet(llm_call.span, agent_name)
+            tool_calls = self._extract_tool_calls_from_llm_node(llm_call)
+            if tool_calls:
+                metadata = dict(triplet.metadata)
+                metadata["tool_calls"] = tool_calls
+                metadata["tool_call_ids"] = [
+                    tool_call["id"] for tool_call in tool_calls if isinstance(tool_call.get("id"), str)
+                ]
+                triplet = triplet.model_copy(update={"metadata": metadata})
             # This is a hot-fix for Tinker+CrewAI, which has some anonymous requests outside the trained agent.
             # TODO: We might need to reconsider this.
             if _skip_empty_token_spans and (
@@ -873,6 +1023,7 @@ class TraceTree:
                     completion_text_to_indices.setdefault(normalized_text, []).append(index)
 
             text_match_offsets: dict[str, int] = {}
+            intermediate_reward_updates: dict[int, float] = {}
             for intermediate_reward in intermediate_rewards:
                 target_index = self._resolve_intermediate_reward_index(
                     intermediate_reward,
@@ -885,9 +1036,12 @@ class TraceTree:
                     and 0 <= target_index < len(transitions)
                     and transitions[target_index].reward is None
                 ):
-                    transitions[target_index] = transitions[target_index].model_copy(
-                        update={"reward": intermediate_reward.value}
+                    intermediate_reward_updates[target_index] = (
+                        intermediate_reward_updates.get(target_index, 0.0) + intermediate_reward.value
                     )
+
+            for target_index, reward_value in intermediate_reward_updates.items():
+                transitions[target_index] = transitions[target_index].model_copy(update={"reward": reward_value})
 
         return transitions
 

@@ -155,6 +155,8 @@ def intermediate_reward_attributes(
     turn_index: Optional[int] = None,
     response_id: Optional[str] = None,
     assistant_response: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    tool_call_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     attrs: Dict[str, Any] = {
         "agentops.task.output": json.dumps({"type": "intermediate_reward", "value": value}),
@@ -165,6 +167,10 @@ def intermediate_reward_attributes(
         attrs["intermediate.response_id"] = response_id
     if assistant_response is not None:
         attrs["intermediate.assistant_response"] = assistant_response
+    if tool_call_id is not None:
+        attrs["intermediate.tool_call_id"] = tool_call_id
+    if tool_call_ids is not None:
+        attrs["intermediate.tool_call_ids"] = json.dumps(tool_call_ids)
     return attrs
 
 
@@ -455,6 +461,111 @@ def test_intermediate_reward_matches_assistant_response_text(monkeypatch: pytest
     trajectory = tree.to_trajectory(agent_match="primary-agent")
 
     assert [triplet.reward for triplet in trajectory] == [None, 0.6]
+
+
+def test_intermediate_reward_matches_tool_call_id(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("STEP_PPO_USE_INTERMEDIATE_REWARDS", "true")
+
+    root = make_span("root", "session", parent_id=None, start_time=0.0, end_time=10.0)
+    agent = make_span(
+        "agent",
+        "agent.node",
+        parent_id="root",
+        start_time=1.0,
+        end_time=9.0,
+        attributes={"agent.name": "primary-agent"},
+    )
+    tool_call = make_llm_span(
+        "llm-tool",
+        parent_id="agent",
+        start=2.0,
+        end=3.0,
+        prompt_ids=[1],
+        response_ids=[2],
+        response_id="resp-tool-call",
+        extra_attrs={
+            "gen_ai.completion.0.finish_reason": "tool_calls",
+            "gen_ai.completion.0.tool_calls.0.id": "call-valid",
+            "gen_ai.completion.0.tool_calls.0.type": "function",
+            "gen_ai.completion.0.tool_calls.0.function.name": "get_reservation",
+            "gen_ai.completion.0.tool_calls.0.function.arguments": '{"reservation_id":"ABC123"}',
+        },
+    )
+    assistant_text = make_llm_span(
+        "llm-text",
+        parent_id="agent",
+        start=4.0,
+        end=5.0,
+        prompt_ids=[3],
+        response_ids=[4],
+        response_id="resp-user-facing-text",
+        extra_attrs={"gen_ai.completion.0.content": "Could you confirm your reservation id?"},
+    )
+    reward = make_span(
+        "intermediate-tool-reward",
+        "agentlightning.intermediate_reward",
+        parent_id="agent",
+        start_time=6.0,
+        end_time=6.1,
+        attributes=intermediate_reward_attributes(-1.0, tool_call_id="call-valid"),
+    )
+
+    tree = TraceTree.from_spans([root, agent, tool_call, assistant_text, reward])
+    trajectory = tree.to_trajectory(agent_match="primary-agent")
+
+    assert trajectory[0].metadata["tool_call_ids"] == ["call-valid"]
+    assert [triplet.reward for triplet in trajectory] == [-1.0, None]
+
+
+def test_intermediate_rewards_sum_when_same_transition(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("STEP_PPO_USE_INTERMEDIATE_REWARDS", "true")
+
+    root = make_span("root", "session", parent_id=None, start_time=0.0, end_time=10.0)
+    agent = make_span(
+        "agent",
+        "agent.node",
+        parent_id="root",
+        start_time=1.0,
+        end_time=9.0,
+        attributes={"agent.name": "primary-agent"},
+    )
+    tool_call = make_llm_span(
+        "llm-tool",
+        parent_id="agent",
+        start=2.0,
+        end=3.0,
+        prompt_ids=[1],
+        response_ids=[2],
+        response_id="resp-tool-call",
+        extra_attrs={
+            "gen_ai.completion.0.finish_reason": "tool_calls",
+            "gen_ai.completion.0.tool_calls.0.id": "call-valid",
+            "gen_ai.completion.0.tool_calls.0.type": "function",
+            "gen_ai.completion.0.tool_calls.0.function.name": "get_reservation",
+            "gen_ai.completion.0.tool_calls.0.function.arguments": '{"reservation_id":"ABC123"}',
+        },
+    )
+    first_reward = make_span(
+        "intermediate-tool-reward-1",
+        "agentlightning.intermediate_reward",
+        parent_id="agent",
+        start_time=6.0,
+        end_time=6.1,
+        attributes=intermediate_reward_attributes(0.1, tool_call_id="call-valid"),
+    )
+    second_reward = make_span(
+        "intermediate-tool-reward-2",
+        "agentlightning.intermediate_reward",
+        parent_id="agent",
+        start_time=6.2,
+        end_time=6.3,
+        attributes=intermediate_reward_attributes(-1.0, tool_call_id="call-valid"),
+    )
+
+    tree = TraceTree.from_spans([root, agent, tool_call, first_reward, second_reward])
+    trajectory = tree.to_trajectory(agent_match="primary-agent")
+
+    assert trajectory[0].reward == pytest.approx(-0.9)
 
 
 def test_tracer_trace_to_triplet_repair_required_for_agent_filter():
